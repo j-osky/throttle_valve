@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Josh Throttle — TV Controller</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#f5f5f7;--surface:#ffffff;--surface2:#f5f5f7;--surface3:#e8e8ed;
+  --border:rgba(0,0,0,0.08);--border-med:rgba(0,0,0,0.12);
+  --text-primary:#1d1d1f;--text-secondary:#6e6e73;--text-tertiary:#aeaeb2;
+  --blue:#0071e3;--blue-lt:#e8f1fb;
+  --green:#34c759;--green-lt:#e8f8ec;
+  --red:#ff3b30;--red-lt:#fff1f0;
+  --orange:#ff9500;--orange-lt:#fff5e6;
+  --yellow:#ffcc00;--yellow-lt:#fffbe6;
+  --purple:#af52de;--purple-lt:#f5eeff;
+  --shadow-sm:0 1px 3px rgba(0,0,0,0.08),0 1px 2px rgba(0,0,0,0.04);
+  --shadow-md:0 4px 16px rgba(0,0,0,0.08),0 1px 4px rgba(0,0,0,0.04);
+  --radius:14px;--radius-sm:8px;
+  --font:'DM Sans',-apple-system,BlinkMacSystemFont,sans-serif;
+  --mono:'DM Mono','SF Mono',monospace;
+}
+body{background:var(--bg);color:var(--text-primary);font-family:var(--font);
+     font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+
+/* ── Header ──────────────────────────────────────────────────────────── */
+header{
+  position:sticky;top:0;z-index:100;
+  background:rgba(255,255,255,0.88);
+  backdrop-filter:saturate(180%) blur(20px);
+  -webkit-backdrop-filter:saturate(180%) blur(20px);
+  border-bottom:1px solid var(--border);
+  padding:0 28px;height:52px;
+  display:flex;align-items:center;justify-content:space-between;
+}
+.brand{display:flex;align-items:center;gap:10px}
+.brand-mark{
+  width:24px;height:24px;background:var(--text-primary);border-radius:6px;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.brand-name{font-size:15px;font-weight:600;color:var(--text-primary);letter-spacing:-0.3px}
+.brand-sep{width:1px;height:14px;background:var(--border-med)}
+.brand-sub{font-size:13px;color:var(--text-secondary);font-weight:400}
+.header-right{display:flex;align-items:center;gap:10px}
+
+/* Connection pill */
+.conn-pill{
+  display:flex;align-items:center;gap:6px;
+  background:var(--surface2);border:1px solid var(--border);
+  border-radius:20px;padding:4px 10px 4px 8px;
+  font-size:12px;font-weight:500;color:var(--text-secondary);
+  transition:all 0.25s ease;
+}
+.conn-pill.ok {background:var(--green-lt);border-color:rgba(52,199,89,0.25);color:#1a7a32}
+.conn-pill.err{background:var(--red-lt);  border-color:rgba(255,59,48,0.25); color:#c0281f}
+.conn-dot{width:7px;height:7px;border-radius:50%;background:var(--text-tertiary);transition:background .25s}
+.conn-pill.ok  .conn-dot{background:var(--green)}
+.conn-pill.err .conn-dot{background:var(--red)}
+
+/* State pill */
+.state-pill{font-size:12px;font-weight:600;letter-spacing:.2px;padding:4px 12px;
+             border-radius:20px;border:1px solid transparent;transition:all .25s ease}
+.state-INIT,.state-READY{background:rgba(0,0,0,.05);color:var(--text-secondary);border-color:var(--border)}
+.state-INIT_IC{background:var(--purple-lt);color:#6b2f9e;border-color:rgba(175,82,222,.3)}
+.state-ARMED  {background:var(--yellow-lt);color:#7a5200;border-color:rgba(255,204,0,.35)}
+.state-RUNNING{background:var(--green-lt); color:#1a7a32;border-color:rgba(52,199,89,.3)}
+.state-FAULT,.state-ESTOP{background:var(--red-lt);color:#c0281f;border-color:rgba(255,59,48,.3)}
+@keyframes pulse-red{0%,100%{opacity:1}50%{opacity:.5}}
+.state-ESTOP{animation:pulse-red .8s ease-in-out infinite}
+
+/* ── Layout ──────────────────────────────────────────────────────────── */
+main{max-width:1040px;margin:0 auto;padding:24px 20px 48px;
+     display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.full{grid-column:1/-1}
+
+/* ── Card ────────────────────────────────────────────────────────────── */
+.card{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);padding:20px;
+  box-shadow:var(--shadow-sm);transition:box-shadow .2s ease,border-color .2s ease;
+}
+.card:hover{box-shadow:var(--shadow-md)}
+.card.fault{border-color:rgba(255,59,48,.3);background:#fffafa}
+.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.card-title{font-size:12px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;color:var(--text-secondary)}
+.card-badge{font-size:11px;font-weight:500;color:var(--text-tertiary);font-family:var(--mono);
+            background:var(--surface2);padding:2px 8px;border-radius:6px;border:1px solid var(--border)}
+
+/* ── Valve cards ─────────────────────────────────────────────────────── */
+.valve-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.valve-col-label{font-size:11px;font-weight:500;letter-spacing:.3px;text-transform:uppercase;
+                  color:var(--text-tertiary);margin-bottom:4px}
+.valve-number{font-size:42px;font-weight:300;letter-spacing:-2px;line-height:1;
+               color:var(--text-primary);transition:color .2s}
+.valve-number .unit{font-size:16px;font-weight:400;letter-spacing:0;color:var(--text-secondary);margin-left:2px}
+.valve-number.fault{color:var(--red)}
+.valve-sub{font-size:12px;color:var(--text-secondary);margin-top:2px;margin-bottom:12px}
+.progress-wrap{margin-bottom:2px}
+.progress-label-row{display:flex;justify-content:space-between;font-size:11px;color:var(--text-tertiary);margin-bottom:5px}
+.progress-track{height:4px;background:var(--surface3);border-radius:2px;overflow:hidden}
+.progress-fill{height:100%;border-radius:2px;transition:width .2s ease}
+.progress-fill.cmd   {background:var(--blue)}
+.progress-fill.actual{background:var(--green)}
+.fmi-tag{display:inline-flex;align-items:center;gap:5px;margin-top:12px;padding:3px 10px;
+          border-radius:6px;font-size:11px;font-weight:500;font-family:var(--mono);
+          background:var(--surface2);color:var(--text-secondary);border:1px solid var(--border);
+          transition:all .2s}
+.fmi-dot{width:6px;height:6px;border-radius:50%;background:var(--green)}
+.fmi-tag.fault{background:var(--red-lt);color:var(--red);border-color:rgba(255,59,48,.25)}
+.fmi-tag.fault .fmi-dot{background:var(--red)}
+
+/* ── Pressures ───────────────────────────────────────────────────────── */
+.pres-rows{display:flex;flex-direction:column}
+.pres-row{display:flex;align-items:center;justify-content:space-between;
+           padding:9px 0;border-bottom:1px solid var(--border)}
+.pres-row:last-child{border-bottom:none}
+.pres-key{font-size:13px;color:var(--text-secondary)}
+.pres-val{font-size:15px;font-weight:500;color:var(--text-primary);font-family:var(--mono)}
+.pres-val.setpt{color:var(--blue)}
+
+/* ── Pressure gauge ──────────────────────────────────────────────────── */
+.pt-gauges{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:4px}
+.pt-gauge{background:var(--surface2);border:1px solid var(--border);
+           border-radius:var(--radius-sm);padding:14px 14px 12px;
+           display:flex;flex-direction:column;gap:6px;transition:border-color .2s}
+.pt-gauge.live{border-color:rgba(52,199,89,.3)}
+.pt-gauge-label{font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--text-tertiary)}
+.pt-gauge-val{font-size:30px;font-weight:300;font-family:var(--mono);letter-spacing:-1px;color:var(--text-primary);line-height:1}
+.pt-gauge-unit{font-size:12px;color:var(--text-secondary);font-weight:400}
+.pt-gauge-setpt{font-size:11px;color:var(--blue);font-family:var(--mono);margin-top:2px}
+.pt-gauge-bar-track{height:3px;background:var(--surface3);border-radius:2px;margin-top:4px;overflow:hidden}
+.pt-gauge-bar-fill{height:100%;border-radius:2px;transition:width .3s ease}
+.pt-gauge-bar-fill.pom{background:var(--blue)}
+.pt-gauge-bar-fill.pfm{background:var(--orange)}
+.pt-gauge-bar-fill.pc {background:var(--purple)}
+.pt-gauge-desc{font-size:10px;color:var(--text-tertiary);margin-top:2px}
+
+/* ── Engine ──────────────────────────────────────────────────────────── */
+.metric-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px}
+.metric-tile{background:var(--surface2);border:1px solid var(--border);
+              border-radius:var(--radius-sm);padding:12px 14px}
+.metric-val{font-size:22px;font-weight:400;color:var(--text-primary);
+             letter-spacing:-.5px;font-family:var(--mono);line-height:1}
+.metric-label{font-size:11px;font-weight:500;color:var(--text-tertiary);
+               text-transform:uppercase;letter-spacing:.4px;margin-top:5px}
+
+/* ── Control panel ───────────────────────────────────────────────────── */
+.control-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.section-label{font-size:12px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;
+                color:var(--text-secondary);margin-bottom:14px;display:flex;align-items:baseline;gap:10px}
+.tuning-badge{font-size:11px;font-weight:500;text-transform:none;letter-spacing:0;
+               color:var(--blue);background:var(--blue-lt);padding:2px 8px;
+               border-radius:6px;border:1px solid rgba(0,113,227,.15);margin-left:auto}
+
+/* Thrust input */
+.thrust-input-row{display:flex;align-items:stretch;gap:10px;margin-bottom:10px}
+.number-field{
+  flex:0 0 110px;background:var(--surface2);border:1px solid var(--border-med);
+  border-radius:var(--radius-sm);padding:10px 14px;
+  font-family:var(--mono);font-size:18px;font-weight:500;color:var(--text-primary);
+  outline:none;transition:border-color .15s,box-shadow .15s;
+  -moz-appearance:textfield;
+}
+.number-field::-webkit-inner-spin-button,.number-field::-webkit-outer-spin-button{-webkit-appearance:none}
+.number-field:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(0,113,227,.12);background:var(--surface)}
+.preview-tile{
+  flex:1;background:var(--surface2);border:1px solid var(--border);
+  border-radius:var(--radius-sm);padding:10px 14px;
+  display:flex;flex-direction:column;justify-content:center;
+  transition:background .15s,border-color .15s;
+}
+.preview-tile.changed{background:#fff8e0;border-color:rgba(255,204,0,.4)}
+.preview-tiny-label{font-size:10px;font-weight:600;letter-spacing:.4px;
+                     text-transform:uppercase;color:var(--text-tertiary);margin-bottom:2px}
+.preview-number{font-size:20px;font-weight:500;font-family:var(--mono);color:var(--text-tertiary);line-height:1;transition:color .15s}
+.preview-number.changed{color:#8c6800}
+.btn-set{
+  background:var(--blue);color:#fff;border:none;border-radius:var(--radius-sm);
+  padding:10px 20px;font-family:var(--font);font-size:14px;font-weight:500;
+  cursor:pointer;transition:background .15s,transform .1s;white-space:nowrap;
+  box-shadow:0 1px 3px rgba(0,113,227,.3);
+}
+.btn-set:hover {background:#0077ed}
+.btn-set:active{background:#006de0;transform:scale(.98)}
+.btn-set:disabled{background:var(--surface3);color:var(--text-tertiary);box-shadow:none;cursor:default}
+.delta-row{font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:6px}
+.delta-chip{font-family:var(--mono);font-size:11px;font-weight:500;padding:1px 7px;border-radius:5px}
+.delta-chip.pos {background:var(--orange-lt);color:#8c4a00}
+.delta-chip.neg {background:var(--blue-lt);  color:#004d99}
+.delta-chip.zero{background:var(--surface2); color:var(--text-tertiary)}
+
+/* ── State buttons ───────────────────────────────────────────────────── */
+/* Button group layout */
+.btn-group{display:flex;flex-direction:column;gap:10px}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap}
+
+.btn{
+  font-family:var(--font);font-size:13px;font-weight:500;
+  padding:9px 16px;border-radius:var(--radius-sm);
+  border:1px solid var(--border-med);cursor:pointer;
+  transition:all .15s;background:var(--surface);
+  display:flex;align-items:center;gap:6px;
+}
+.btn:hover:not(:disabled){background:var(--surface2)}
+.btn:active:not(:disabled){transform:scale(.97)}
+.btn:disabled{opacity:.38;cursor:default}
+
+/* Init IC — purple */
+.btn-init-ic{
+  color:#6b2f9e;background:var(--purple-lt);
+  border-color:rgba(175,82,222,.3);
+}
+.btn-init-ic:hover:not(:disabled){background:#ede0f7}
+
+/* Arm — yellow */
+.btn-arm{color:#7a5200;background:var(--yellow-lt);border-color:rgba(255,204,0,.35)}
+.btn-arm:hover:not(:disabled){background:#fff3cc}
+
+/* Fire (was Run) — green */
+.btn-fire{color:#1a7a32;background:var(--green-lt);border-color:rgba(52,199,89,.3)}
+.btn-fire:hover:not(:disabled){background:#d4f7de}
+
+/* Halt (was Stop) — orange */
+.btn-halt{color:#8c4a00;background:var(--orange-lt);border-color:rgba(255,149,0,.3)}
+.btn-halt:hover:not(:disabled){background:#ffe8b3}
+
+/* Emergency Stop — red, full row */
+.btn-estop{
+  color:#fff;background:var(--red);border-color:var(--red);
+  font-weight:600;font-size:13px;
+  box-shadow:0 1px 4px rgba(255,59,48,.25);
+  padding:9px 22px;
+}
+.btn-estop:hover:not(:disabled){background:#e0342a}
+
+/* Button tooltip labels */
+.btn-desc{font-size:11px;color:var(--text-tertiary);margin-top:4px;line-height:1.4;font-style:italic}
+
+/* ── Diagnostics ─────────────────────────────────────────────────────── */
+.diag-bar{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);padding:14px 20px;
+  display:flex;gap:0;box-shadow:var(--shadow-sm);
+}
+.diag-item{
+  flex:1;display:flex;flex-direction:column;align-items:center;
+  padding:0 12px;border-right:1px solid var(--border);
+}
+.diag-item:last-child{border-right:none}
+.diag-val{font-size:16px;font-weight:500;font-family:var(--mono);color:var(--text-primary);line-height:1}
+.diag-val.warn{color:var(--orange)}
+.diag-label{font-size:10px;font-weight:500;text-transform:uppercase;
+             letter-spacing:.5px;color:var(--text-tertiary);margin-top:4px}
+
+/* ── Log strip ───────────────────────────────────────────────────────── */
+.log-card{background:var(--surface);border:1px solid var(--border);
+           border-radius:var(--radius);box-shadow:var(--shadow-sm);overflow:hidden}
+.log-header{
+  padding:10px 16px;border-bottom:1px solid var(--border);
+  font-size:11px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;
+  color:var(--text-secondary);display:flex;align-items:center;gap:6px;
+}
+.log-dot{width:6px;height:6px;border-radius:50%;background:var(--green)}
+.log-body{
+  height:72px;overflow-y:auto;padding:6px 16px;
+  display:flex;flex-direction:column-reverse;
+  font-family:var(--mono);font-size:11.5px;
+}
+.log-line{padding:2px 0;line-height:1.5}
+.lt  {color:var(--text-tertiary)}
+.lok {color:#1a7a32}
+.lwarn{color:#7a5200}
+.lerr{color:var(--red)}
+.ldef{color:var(--text-secondary)}
+
+/* ── Footer ──────────────────────────────────────────────────────────── */
+footer{text-align:center;padding:20px;font-size:12px;color:var(--text-tertiary)}
+footer span{font-weight:500;color:var(--text-secondary)}
+
+/* ── Animations ──────────────────────────────────────────────────────── */
+@keyframes fadein{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.card,.diag-bar,.log-card{animation:fadein .35s ease both}
+.card:nth-child(1){animation-delay:.04s}
+.card:nth-child(2){animation-delay:.08s}
+.card:nth-child(3){animation-delay:.12s}
+.card:nth-child(4){animation-delay:.16s}
+
+/* ── Responsive ──────────────────────────────────────────────────────── */
+@media(max-width:680px){
+  main{grid-template-columns:1fr;padding:16px 12px 40px}
+  .control-grid{grid-template-columns:1fr}
+  .valve-grid{grid-template-columns:1fr 1fr}
+  .valve-number{font-size:32px}
+  .diag-bar{flex-wrap:wrap;gap:10px}
+  .diag-item{border-right:none;align-items:flex-start;flex:0 0 calc(33% - 6px)}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="brand-mark">
+      <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+        <rect x="1" y="5" width="10" height="2" rx="1" fill="white"/>
+        <rect x="5" y="1" width="2" height="10" rx="1" fill="white"/>
+      </svg>
+    </div>
+    <span class="brand-name">Josh Throttle</span>
+    <div class="brand-sep"></div>
+    <span class="brand-sub">TV Controller — tv_controller_2_1</span>
+  </div>
+  <div class="header-right">
+    <div class="conn-pill" id="conn_pill">
+      <span class="conn-dot" id="conn_dot"></span>
+      <span id="conn_label">Connecting</span>
+    </div>
+    <span class="state-pill state-INIT" id="state_badge">INIT</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- LOX Valve -->
+  <div class="card" id="lox_card">
+    <div class="card-header">
+      <span class="card-title">LOX Valve</span>
+      <span class="card-badge">0xBE · 190</span>
+    </div>
+    <div class="valve-grid">
+      <div>
+        <div class="valve-col-label">Commanded</div>
+        <div class="valve-number" id="lox_cmd">--<span class="unit">°</span></div>
+        <div class="valve-sub" id="lox_cmd_sub">— % open</div>
+        <div class="progress-wrap">
+          <div class="progress-label-row"><span>0°</span><span>90°</span></div>
+          <div class="progress-track"><div class="progress-fill cmd" id="lox_cmd_bar" style="width:0%"></div></div>
+        </div>
+      </div>
+      <div>
+        <div class="valve-col-label">Actual (CAN)</div>
+        <div class="valve-number" id="lox_act">--<span class="unit">°</span></div>
+        <div class="valve-sub" id="lox_act_sub">— % open</div>
+        <div class="progress-wrap">
+          <div class="progress-label-row"><span>0°</span><span>90°</span></div>
+          <div class="progress-track"><div class="progress-fill actual" id="lox_act_bar" style="width:0%"></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="fmi-tag" id="lox_fmi"><span class="fmi-dot"></span>FMI 0 — OK</div>
+  </div>
+
+  <!-- IPA Valve -->
+  <div class="card" id="ipa_card">
+    <div class="card-header">
+      <span class="card-title">IPA Valve</span>
+      <span class="card-badge">0xBF · 191</span>
+    </div>
+    <div class="valve-grid">
+      <div>
+        <div class="valve-col-label">Commanded</div>
+        <div class="valve-number" id="ipa_cmd">--<span class="unit">°</span></div>
+        <div class="valve-sub" id="ipa_cmd_sub">— % open</div>
+        <div class="progress-wrap">
+          <div class="progress-label-row"><span>0°</span><span>90°</span></div>
+          <div class="progress-track"><div class="progress-fill cmd" id="ipa_cmd_bar" style="width:0%"></div></div>
+        </div>
+      </div>
+      <div>
+        <div class="valve-col-label">Actual (CAN)</div>
+        <div class="valve-number" id="ipa_act">--<span class="unit">°</span></div>
+        <div class="valve-sub" id="ipa_act_sub">— % open</div>
+        <div class="progress-wrap">
+          <div class="progress-label-row"><span>0°</span><span>90°</span></div>
+          <div class="progress-track"><div class="progress-fill actual" id="ipa_act_bar" style="width:0%"></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="fmi-tag" id="ipa_fmi"><span class="fmi-dot"></span>FMI 0 — OK</div>
+  </div>
+
+  <!-- Pressure Transducers — full width card with live gauges -->
+  <div class="card full">
+    <div class="card-header">
+      <span class="card-title">Pressure Transducers — Live DAQstra Reads</span>
+      <span class="card-badge" id="pt_rate_badge">— Hz</span>
+    </div>
+    <div class="pt-gauges">
+
+      <!-- POM gauge (LOX manifold) -->
+      <div class="pt-gauge" id="pom_gauge">
+        <div class="pt-gauge-label">POM &mdash; LOX Manifold</div>
+        <div>
+          <span class="pt-gauge-val" id="pom_val">—</span>
+          <span class="pt-gauge-unit">psi</span>
+        </div>
+        <div class="pt-gauge-setpt" id="pom_set_line">Setpoint: — psi</div>
+        <div class="pt-gauge-bar-track">
+          <div class="pt-gauge-bar-fill pom" id="pom_bar" style="width:0%"></div>
+        </div>
+        <div class="pt-gauge-desc">b1_log_data_ads1256#0 &nbsp;&middot;&nbsp; LOX injector upstream</div>
+      </div>
+
+      <!-- PFM gauge (IPA manifold) -->
+      <div class="pt-gauge" id="pfm_gauge">
+        <div class="pt-gauge-label">PFM &mdash; IPA Manifold</div>
+        <div>
+          <span class="pt-gauge-val" id="pfm_val">—</span>
+          <span class="pt-gauge-unit">psi</span>
+        </div>
+        <div class="pt-gauge-setpt">&nbsp;</div>
+        <div class="pt-gauge-bar-track">
+          <div class="pt-gauge-bar-fill pfm" id="pfm_bar" style="width:0%"></div>
+        </div>
+        <div class="pt-gauge-desc">b1_log_data_ads1256#1 &nbsp;&middot;&nbsp; IPA injector upstream</div>
+      </div>
+
+      <!-- PC gauge (chamber) -->
+      <div class="pt-gauge" id="pc_gauge">
+        <div class="pt-gauge-label">Pc &mdash; Chamber</div>
+        <div>
+          <span class="pt-gauge-val" id="pc_val">—</span>
+          <span class="pt-gauge-unit">psi</span>
+        </div>
+        <div class="pt-gauge-setpt">&nbsp;</div>
+        <div class="pt-gauge-bar-track">
+          <div class="pt-gauge-bar-fill pc" id="pc_bar" style="width:0%"></div>
+        </div>
+        <div class="pt-gauge-desc">b1_log_data_ads1256#2 &nbsp;&middot;&nbsp; combustion chamber</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Engine -->
+  <div class="card">
+    <div class="card-header"><span class="card-title">Engine</span></div>
+    <div class="metric-grid">
+      <div class="metric-tile">
+        <div class="metric-val" id="thr_set">—</div>
+        <div class="metric-label">Thrust set (lbf)</div>
+      </div>
+      <div class="metric-tile">
+        <div class="metric-val" id="thr_est">—</div>
+        <div class="metric-label">Thrust est (lbf)</div>
+      </div>
+      <div class="metric-tile">
+        <div class="metric-val" id="mr">—</div>
+        <div class="metric-label">MR estimate</div>
+      </div>
+      <div class="metric-tile">
+        <div class="metric-val">1.200</div>
+        <div class="metric-label">MR setpoint</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Control panel -->
+  <div class="full control-grid">
+
+    <!-- Thrust setpoint -->
+    <div class="card">
+      <div class="section-label">
+        Thrust Setpoint
+        <span class="tuning-badge">Tuned for 450 – 650 lbf</span>
+      </div>
+      <div class="thrust-input-row">
+        <input class="number-field" type="number" id="thrust_input"
+               value="500" min="0" max="800" step="10" placeholder="lbf">
+        <div class="preview-tile" id="preview_tile">
+          <div class="preview-tiny-label">Preview</div>
+          <div class="preview-number" id="thrust_preview">500 lbf</div>
+        </div>
+        <button class="btn-set" onclick="submitThrust()">Set</button>
+      </div>
+      <div class="delta-row">
+        <span style="color:var(--text-tertiary)">Active:</span>
+        <span id="thr_active" style="font-family:var(--mono);font-weight:500">—</span>
+        <span style="color:var(--text-tertiary)">lbf</span>
+        <span style="margin:0 4px;color:var(--border-med)">·</span>
+        <span style="color:var(--text-tertiary)">Δ</span>
+        <span class="delta-chip zero" id="thr_delta">—</span>
+      </div>
+    </div>
+
+    <!-- State control -->
+    <div class="card">
+      <div class="section-label">State Control</div>
+      <div class="btn-group">
+
+        <!-- Row 1: Init IC -->
+        <div>
+          <div class="btn-row">
+            <button class="btn btn-init-ic" onclick="sendCmd('init_ic')">
+              &#9741; Init ICs
+            </button>
+          </div>
+          <div class="btn-desc">
+            Drive both valves to 500 lbf initial conditions
+            (LOX&nbsp;41.06°, IPA&nbsp;40.68°) before a run.
+            Safe to use from READY or ARMED.
+          </div>
+        </div>
+
+        <!-- Row 2: Arm + Fire -->
+        <div>
+          <div class="btn-row">
+            <button class="btn btn-arm"  onclick="sendCmd('arm')">
+              &#9673; Arm
+            </button>
+            <button class="btn btn-fire" onclick="sendCmd('run')">
+              &#9654; Fire
+            </button>
+            <button class="btn btn-halt" onclick="sendCmd('stop')">
+              &#9646;&#9646; Halt
+            </button>
+          </div>
+          <div class="btn-desc">
+            <strong>Arm</strong> — confirms system ready, enables Fire.&nbsp;&nbsp;
+            <strong>Fire</strong> — enables closed-loop CAN commands at 10&nbsp;Hz.&nbsp;&nbsp;
+            <strong>Halt</strong> — stops commands and closes valves to 0°.
+          </div>
+        </div>
+
+        <!-- Row 3: E-Stop -->
+        <div>
+          <div class="btn-row">
+            <button class="btn btn-estop" onclick="sendEstop()">
+              &#9889; Emergency Stop
+            </button>
+          </div>
+          <div class="btn-desc">
+            Immediately closes both valves and locks system into
+            ESTOP state. Requires power cycle to clear.
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Diagnostics bar -->
+  <div class="diag-bar full">
+    <div class="diag-item">
+      <span class="diag-val" id="d_ticks">—</span>
+      <span class="diag-label">Ctrl Ticks</span>
+    </div>
+    <div class="diag-item">
+      <span class="diag-val" id="d_can">—</span>
+      <span class="diag-label">CAN Sends</span>
+    </div>
+    <div class="diag-item" id="d_ovrn_item">
+      <span class="diag-val" id="d_ovrn">—</span>
+      <span class="diag-label">Overruns</span>
+    </div>
+    <div class="diag-item">
+      <span class="diag-val" id="d_dt">—</span>
+      <span class="diag-label">Loop ms</span>
+    </div>
+    <div class="diag-item">
+      <span class="diag-val" id="d_lox_bus">—</span>
+      <span class="diag-label">LOX Bus</span>
+    </div>
+    <div class="diag-item">
+      <span class="diag-val" id="d_ipa_bus">—</span>
+      <span class="diag-label">IPA Bus</span>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="log-card full">
+    <div class="log-header">
+      <span class="log-dot"></span>Event Log
+    </div>
+    <div class="log-body" id="log_body">
+      <div class="log-line">
+        <span class="lt">[--:--:--]</span>
+        <span class="ldef"> Waiting for controller...</span>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<footer>
+  Designed by <span>Josh</span> with <span>Claude</span>
+  &nbsp;·&nbsp; tv_controller_2_1 @ 170 Hz
+</footer>
+
+<script>
+const API = 'http://localhost:8080';
+let activeThrust = null;
+let lastState    = null;
+let pollOk       = false;
+
+function log(msg, cls='ldef') {
+  const body = document.getElementById('log_body');
+  const ts   = new Date().toTimeString().slice(0,8);
+  const d    = document.createElement('div');
+  d.className = 'log-line';
+  d.innerHTML = `<span class="lt">[${ts}]</span><span class="${cls}"> ${msg}</span>`;
+  body.appendChild(d);
+  while (body.children.length > 80) body.removeChild(body.firstChild);
+}
+
+/* ── Thrust preview ──────────────────────────────────────────────────── */
+const inp      = document.getElementById('thrust_input');
+const prevTxt  = document.getElementById('thrust_preview');
+const prevTile = document.getElementById('preview_tile');
+const deltEl   = document.getElementById('thr_delta');
+
+inp.addEventListener('input', updatePreview);
+inp.addEventListener('keydown', e => { if (e.key === 'Enter') submitThrust(); });
+
+function updatePreview() {
+  const v = parseFloat(inp.value);
+  if (isNaN(v)) {
+    prevTxt.textContent = '— lbf'; prevTxt.className = 'preview-number';
+    prevTile.className  = 'preview-tile'; return;
+  }
+  prevTxt.textContent = v.toFixed(0) + ' lbf';
+  const changed = activeThrust !== null && Math.abs(v - activeThrust) >= 0.5;
+  prevTxt.className  = 'preview-number' + (changed ? ' changed' : '');
+  prevTile.className = 'preview-tile'   + (changed ? ' changed' : '');
+  if (activeThrust === null) {
+    deltEl.textContent = '—'; deltEl.className = 'delta-chip zero';
+  } else {
+    const d = v - activeThrust;
+    deltEl.textContent = (d >= 0 ? '+' : '') + d.toFixed(0);
+    deltEl.className   = 'delta-chip ' + (d > 0.5 ? 'pos' : d < -0.5 ? 'neg' : 'zero');
+  }
+}
+
+async function submitThrust() {
+  const v = parseFloat(inp.value);
+  if (isNaN(v) || v < 0 || v > 800) { log('Invalid thrust: ' + inp.value, 'lerr'); return; }
+  try {
+    const r = await fetch(API + '/api/thrust', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({thrust_lbf: v})
+    });
+    if (r.ok) {
+      activeThrust = v;
+      document.getElementById('thr_active').textContent = v.toFixed(0);
+      updatePreview();
+      log('Thrust setpoint → ' + v.toFixed(0) + ' lbf', 'lok');
+    } else log('Set thrust failed — HTTP ' + r.status, 'lerr');
+  } catch(e) { log('Set thrust error: ' + e.message, 'lerr'); }
+}
+
+/* ── Commands ────────────────────────────────────────────────────────── */
+async function sendCmd(cmd) {
+  try {
+    const r = await fetch(API + '/api/cmd/' + cmd, {method:'POST'});
+    const labels = {
+      init_ic:'Init ICs — valves → 500 lbf positions',
+      arm:    'Armed — ready to fire',
+      run:    'Fire — control loop enabled',
+      stop:   'Halt — valves closed to 0°',
+      estop:  'EMERGENCY STOP'
+    };
+    if (r.ok) log(labels[cmd] || ('Command: ' + cmd.toUpperCase()), cmd === 'estop' ? 'lerr' : 'lok');
+    else      log('Command ' + cmd + ' failed — HTTP ' + r.status, 'lerr');
+  } catch(e) { log('Command error: ' + e.message, 'lerr'); }
+}
+
+async function sendEstop() { log('EMERGENCY STOP TRIGGERED', 'lerr'); await sendCmd('estop'); }
+
+/* ── DOM helpers ─────────────────────────────────────────────────────── */
+function set(id, v) { const e = document.getElementById(id); if(e) e.textContent = v; }
+
+function setValveNumber(id, val, fault) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.innerHTML = val + '<span class="unit">°</span>';
+  el.className = 'valve-number' + (fault ? ' fault' : '');
+}
+
+function setBar(barId, subId, deg) {
+  const pct = Math.max(0, Math.min(100, (deg/90)*100));
+  const b = document.getElementById(barId); if(b) b.style.width = pct.toFixed(1) + '%';
+  const s = document.getElementById(subId); if(s) s.textContent = pct.toFixed(0) + '% open';
+}
+
+const FMI_LABELS = {0:'OK', 3:'Over Voltage', 4:'Under Voltage', 7:'Position Timeout', 13:'Not Calibrated'};
+function fmiStr(f) { return 'FMI ' + f + ' — ' + (FMI_LABELS[f] || 'Unknown'); }
+
+function setFmi(elId, fmi) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  const fault = fmi > 0;
+  el.className = 'fmi-tag' + (fault ? ' fault' : '');
+  el.innerHTML = `<span class="fmi-dot"></span>${fmiStr(fmi)}`;
+}
+
+/* ── Poll ────────────────────────────────────────────────────────────── */
+async function poll() {
+  try {
+    const r = await fetch(API + '/api/status', {signal: AbortSignal.timeout(800)});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+
+    document.getElementById('conn_pill').className = 'conn-pill ok';
+    set('conn_label', 'Connected');
+    if (!pollOk) { log('Controller connected', 'lok'); pollOk = true; }
+
+    const badge = document.getElementById('state_badge');
+    badge.textContent = d.state;
+    badge.className   = 'state-pill state-' + d.state;
+    if (d.state !== lastState) {
+      const cls = (d.state==='FAULT'||d.state==='ESTOP') ? 'lerr'
+                : d.state==='RUNNING' ? 'lok' : 'lwarn';
+      const stateDesc = {
+        INIT:    'System initialising — waiting for valves on CAN bus',
+        READY:   'Ready — valves on bus, no faults',
+        INIT_IC: 'Initialising ICs — driving valves to 500 lbf positions',
+        ARMED:   'Armed — system confirmed ready, awaiting Fire command',
+        RUNNING: 'Running — closed-loop control active at 10 Hz',
+        FAULT:   'Fault — valve FMI error detected, valves safe',
+        ESTOP:   'Emergency Stop — power cycle required to clear'
+      };
+      log('State → ' + d.state + ' (' + (stateDesc[d.state]||'') + ')', cls);
+      lastState = d.state;
+    }
+
+    /* LOX */
+    const lf = d.lox_fmi > 0;
+    document.getElementById('lox_card').className = 'card' + (lf ? ' fault' : '');
+    setValveNumber('lox_cmd', d.lox_cmd_deg.toFixed(1), lf);
+    setValveNumber('lox_act', d.lox_actual_deg, lf);
+    setBar('lox_cmd_bar', 'lox_cmd_sub', d.lox_cmd_deg);
+    setBar('lox_act_bar', 'lox_act_sub', d.lox_actual_deg);
+    setFmi('lox_fmi', d.lox_fmi);
+    if (lf) log('LOX ' + fmiStr(d.lox_fmi), 'lerr');
+
+    /* IPA */
+    const af = d.ipa_fmi > 0;
+    document.getElementById('ipa_card').className = 'card' + (af ? ' fault' : '');
+    setValveNumber('ipa_cmd', d.ipa_cmd_deg.toFixed(1), af);
+    setValveNumber('ipa_act', d.ipa_actual_deg, af);
+    setBar('ipa_cmd_bar', 'ipa_cmd_sub', d.ipa_cmd_deg);
+    setBar('ipa_act_bar', 'ipa_act_sub', d.ipa_actual_deg);
+    setFmi('ipa_fmi', d.ipa_fmi);
+    if (af) log('IPA ' + fmiStr(d.ipa_fmi), 'lerr');
+
+    /* Pressures — update main card values */
+    set('pom',     d.pom_psi.toFixed(1)     + ' psi');
+    set('pom_set', d.pom_set_psi.toFixed(1) + ' psi');
+    set('pfm',     d.pfm_psi.toFixed(1)     + ' psi');
+    set('pc',      d.pc_psi.toFixed(1)       + ' psi');
+
+    /* PT Gauge panels — live readings */
+    const PT_MAX = 600;  // psi — full-scale for bar fill (adjust to your system)
+    // POM gauge
+    set('pom_val', d.pom_psi.toFixed(1));
+    set('pom_set_line', 'Setpoint: ' + d.pom_set_psi.toFixed(1) + ' psi');
+    const pomBar = document.getElementById('pom_bar');
+    if (pomBar) pomBar.style.width = Math.min(100,(d.pom_psi/PT_MAX)*100).toFixed(1)+'%';
+    const pomG = document.getElementById('pom_gauge');
+    if (pomG) pomG.className = 'pt-gauge' + (d.pom_psi > 0 ? ' live' : '');
+    // PFM gauge
+    set('pfm_val', d.pfm_psi.toFixed(1));
+    const pfmBar = document.getElementById('pfm_bar');
+    if (pfmBar) pfmBar.style.width = Math.min(100,(d.pfm_psi/PT_MAX)*100).toFixed(1)+'%';
+    const pfmG = document.getElementById('pfm_gauge');
+    if (pfmG) pfmG.className = 'pt-gauge' + (d.pfm_psi > 0 ? ' live' : '');
+    // PC gauge
+    set('pc_val', d.pc_psi.toFixed(1));
+    const pcBar = document.getElementById('pc_bar');
+    if (pcBar) pcBar.style.width = Math.min(100,(d.pc_psi/PT_MAX)*100).toFixed(1)+'%';
+    const pcG = document.getElementById('pc_gauge');
+    if (pcG) pcG.className = 'pt-gauge' + (d.pc_psi > 0 ? ' live' : '');
+    // Show that we're getting live data — display poll rate badge
+    set('pt_rate_badge', '2 Hz GUI · 170 Hz ctrl');
+
+    /* Engine */
+    set('thr_set', d.thrust_lbf_set.toFixed(0) + ' lbf');
+    set('thr_est', d.thrust_est_lbf.toFixed(1) + ' lbf');
+    set('mr',      d.mr_est.toFixed(3));
+
+    /* Sync active thrust on first poll */
+    if (activeThrust === null) {
+      activeThrust = d.thrust_lbf_set;
+      set('thr_active', d.thrust_lbf_set.toFixed(0));
+      updatePreview();
+    }
+
+    /* Diagnostics */
+    set('d_ticks', Number(d.tick_count).toLocaleString());
+    set('d_can',   d.can_send_count !== undefined ? Number(d.can_send_count).toLocaleString() : '—');
+    set('d_dt',    d.loop_dt_ms.toFixed(2));
+    const ov = d.overrun_count || 0;
+    set('d_ovrn', ov);
+    const ovEl = document.getElementById('d_ovrn_item');
+    if (ovEl) ovEl.querySelector('.diag-val').className = 'diag-val' + (ov > 0 ? ' warn' : '');
+    set('d_lox_bus', d.lox_on_bus ? '✓' : '✗');
+    set('d_ipa_bus', d.ipa_on_bus ? '✓' : '✗');
+
+  } catch(e) {
+    document.getElementById('conn_pill').className = 'conn-pill err';
+    set('conn_label', 'No Connection');
+    if (pollOk) { log('Lost connection to controller', 'lerr'); pollOk = false; }
+  }
+}
+
+poll();
+setInterval(poll, 500);
+</script>
+</body>
+</html>

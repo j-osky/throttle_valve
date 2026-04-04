@@ -764,21 +764,39 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
     }
 }
 
-static void gui_poll(void)
+/* gui_poll() is now a no-op — the GUI server runs in its own thread.
+ * gui_thread() below does the accept/read/respond loop without blocking
+ * the 170 Hz control loop at all.                                       */
+static void gui_poll(void) { /* intentionally empty */ }
+
+static void *gui_thread(void *arg)
 {
-    struct sockaddr_in client;
-    socklen_t clen = sizeof(client);
-    int cfd = accept(gui_sock, (struct sockaddr *)&client, &clen);
-    if (cfd < 0) return;  /* EAGAIN = no connection waiting */
+    (void)arg;
+    /* gui_sock listen fd is already open and non-blocking from gui_init().
+     * We re-set it to BLOCKING here so accept() waits efficiently instead
+     * of spinning.  This thread owns the fd exclusively after main() spawns it. */
+    int flags = fcntl(gui_sock, F_GETFL, 0);
+    (void)fcntl(gui_sock, F_SETFL, flags & ~O_NONBLOCK);
 
-    /* Set 100 ms receive timeout */
-    struct timeval tv = {0, 100000};
-    (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    while (g_running) {
+        struct sockaddr_in client;
+        socklen_t clen = sizeof(client);
+        int cfd = accept(gui_sock, (struct sockaddr *)&client, &clen);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
 
-    char buf[2048] = {0};
-    ssize_t n = read(cfd, buf, sizeof(buf) - 1);
-    if (n > 0) gui_handle_request(cfd, buf, n);
-    close(cfd);
+        /* 200 ms receive timeout — enough for any localhost HTTP request */
+        struct timeval tv = {0, 200000};
+        (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        char buf[2048] = {0};
+        ssize_t n = read(cfd, buf, sizeof(buf) - 1);
+        if (n > 0) gui_handle_request(cfd, buf, n);
+        close(cfd);
+    }
+    return NULL;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -832,6 +850,11 @@ int main(void)
 
     /* ── GUI server ─────────────────────────────────────────────────────── */
     gui_init();
+    pthread_t gui_tid;
+    if (pthread_create(&gui_tid, NULL, gui_thread, NULL) != 0) {
+        fprintf(stderr, "Failed to create GUI thread\n"); return 1;
+    }
+    pthread_detach(gui_tid);
 
     /* ── Simulink model init ────────────────────────────────────────────── */
     tv_controller_2_1_initialize();
@@ -931,8 +954,8 @@ int main(void)
             }
         }
 
-        /* ── 7. GUI poll (non-blocking accept) ───────────────────────────── */
-        gui_poll();
+        /* ── 7. GUI poll — handled by gui_thread() (pthread) ─────────────── */
+        /* gui_poll() intentionally empty; GUI runs in background thread     */
 
         /* ── 8. Fault → safe state ───────────────────────────────────────── */
         pthread_mutex_lock(&state_mutex);
@@ -961,11 +984,13 @@ int main(void)
     can_drive_safe();
     usleep(200000);
 
+    /* Closing gui_sock unblocks the gui_thread accept() so it exits */
+    close(gui_sock);
+
     tv_controller_2_1_terminate();
     curl_easy_cleanup(curl);
     curl_global_cleanup();
     close(can_sock);
-    close(gui_sock);
 
     printf("[CTRL] Clean exit\n");
     return 0;

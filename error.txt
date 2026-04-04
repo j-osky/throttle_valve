@@ -1,0 +1,36 @@
+benyahu@benyahu:~/throttle_valve$ python3 mock_daq.py
+[MockDAQ] Josh Throttle Mock DAQ Server
+[MockDAQ] Listening on http://0.0.0.0:8050
+[MockDAQ] Physics: Moonshine 2 orifice flow model at 170 Hz
+[MockDAQ] Sensor endpoints:
+  GET /api/v1/sensors/b1_log_data_ads1256%230  → POM
+  GET /api/v1/sensors/b1_log_data_ads1256%231  → PFM
+  GET /api/v1/sensors/b1_log_data_ads1256%232  → PC
+[MockDAQ] Set valve angles: POST /mock/valve_angles
+[MockDAQ] Debug physics:    GET /mock/status
+
+benyahu@benyahu:~/throttle_valve$ curl http://localhost:8050/health
+{"status": "ok", "service": "mock_daq", "mqtt_connected": true, "sensors_loaded": 3}benyahu@benyahu:~/throttle_valve$ python3 mock_can_bridge.py
+[Bridge] Connected to CAN interface: can0
+[Bridge] Address claims sent: LOX=0xBE, IPA=0xBF
+[Bridge] Listening for Prop A2 commands on can0...
+[Bridge] Will relay valve angles to http://localhost:8050
+
+benyahu@benyahu:~/throttle_valve$ sudo ./tv_main
+[sudo: authenticate] Password: 
+╔══════════════════════════════════════════════════════╗
+║       Josh Throttle — TV Controller                  ║
+║     tv_controller_2_1 @ 170 Hz | CAN @ 10 Hz        ║
+╚══════════════════════════════════════════════════════╝
+
+[CAN] Opened can0 (fd=3)
+[GUI] HTTP server on port 8080
+[CTRL] Simulink model initialised
+       LOX IC = 41.06 deg  IPA IC = 40.68 deg
+[CAN] Address claim sent (SA=0x01)
+[INIT] Waiting for valve address claims (up to 5s)...
+[INIT] Both valves on bus
+[CAN] Periodic position broadcast configured at 100 ms
+[INIT] Moving valves to ICs: LOX=41.1° IPA=40.7°
+[INIT] Valves at IC positions
+[CTRL] State → READY. Open http://localhost:8080

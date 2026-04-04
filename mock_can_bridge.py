@@ -204,7 +204,7 @@ class MockCANBridge:
 
     def connect(self):
         """Open the SocketCAN interface via python-can."""
-        self.bus = can.interface.Bus(channel=self.iface, bustype="socketcan")
+        self.bus = can.interface.Bus(channel=self.iface, interface="socketcan")
         print(f"[Bridge] Connected to CAN interface: {self.iface}")
 
     def slew_valves(self):

@@ -377,12 +377,23 @@ static void can_send_valve_commands(double lox_deg, double ipa_deg)
 /* ── Drive both valves to safe state (0° = closed) ──────────────────────── */
 static void can_drive_safe(void)
 {
+    /* Send 0-degree command to both valves.  The printf is rate-limited so
+     * it fires only once per transition into safe state, not 170x/sec.     */
+    static SystemState last_safe_state = -1;
     struct can_frame f;
     f = kz_build_absolute_deg(KZVALVE_SA_LOX, KZVALVE_SA_PI, 0, 100);
     can_send_frame(&f);
     f = kz_build_absolute_deg(KZVALVE_SA_IPA, KZVALVE_SA_PI, 0, 100);
     can_send_frame(&f);
-    printf("[CAN] Valves commanded to SAFE (0 deg)\n");
+
+    pthread_mutex_lock(&state_mutex);
+    SystemState cur = g_state.state;
+    pthread_mutex_unlock(&state_mutex);
+    if (cur != last_safe_state) {
+        printf("[CAN] Valves commanded to SAFE (0 deg) — state=%s\n",
+               state_names[cur]);
+        last_safe_state = cur;
+    }
 }
 
 /* ── Parse incoming CAN frames ──────────────────────────────────────────── */
@@ -395,8 +406,12 @@ static void can_process_rx(void)
         uint8_t  sa  = kz_src_addr(&f);
         uint32_t pgn = kz_pgn(&f);
 
-        /* Prop A2 position feedback (PGN 0x01EF00) */
-        if ((pgn & 0x1FF00u) == 0x1EF00u) {
+        /* Prop A2 position feedback (PGN 0x01EF00, DP=1, PF=0xEF).
+         * Only process frames from known valve addresses (LOX=0xBE, IPA=0xBF).
+         * This prevents misinterpreting other CAN traffic as position feedback.
+         * DLC must be 8 and the frame must not be an error frame.          */
+        bool is_known_valve = (sa == KZVALVE_SA_LOX || sa == KZVALVE_SA_IPA);
+        if ((pgn & 0x1FF00u) == 0x1EF00u && is_known_valve && f.can_dlc == 8) {
             uint8_t fmi = 0;
             uint8_t pos = kz_parse_position(&f, &fmi);
 
@@ -411,7 +426,9 @@ static void can_process_rx(void)
                 g_state.ipa_on_bus     = true;
             }
 
-            /* Fault detection */
+            /* Fault detection — only on confirmed bad FMI codes, only when
+             * RUNNING. FMI=0 is normal. FMI values 1,2,5,6,8-12 are not used
+             * by KZValve so treat any unexpected nonzero as a warning only.  */
             if (fmi == FMI_POS_TIMEOUT || fmi == FMI_NOT_CALIBRATED ||
                 fmi == FMI_UNDER_VOLTAGE) {
                 if (g_state.state == SYS_RUNNING) {

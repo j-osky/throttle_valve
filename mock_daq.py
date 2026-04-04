@@ -287,17 +287,29 @@ SENSOR_TITLE_MAP = {
 class Handler(BaseHTTPRequestHandler):
     """Handles DAQstra-compatible HTTP requests."""
 
+    def handle_error(self):
+        """Suppress BrokenPipe tracebacks — these are normal at 170 Hz read rate."""
+        pass
+
     def log_message(self, *args):
         pass  # Suppress per-request console logs to reduce noise
 
     def send_json(self, code: int, obj: dict):
-        """Send an HTTP response with JSON body."""
+        """Send an HTTP response with JSON body.
+        Silently ignores BrokenPipe / ConnectionReset — tv_main opens a new
+        connection for every sensor read at 170 Hz and closes it very quickly,
+        so the server-side write occasionally races the client disconnect.
+        The data was already read successfully by the client before the pipe broke.
+        """
         body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Client closed connection before we finished — normal at 170 Hz
 
     def do_GET(self):
         path = urlparse(self.path).path.rstrip("/")
@@ -384,6 +396,46 @@ class Handler(BaseHTTPRequestHandler):
 # ENTRY POINT
 # =============================================================================
 
+# =============================================================================
+# QUIET HTTP SERVER — suppresses BrokenPipe tracebacks at 170 Hz read rate
+# =============================================================================
+
+class QuietHTTPServer(HTTPServer):
+    """HTTPServer subclass that silently drops BrokenPipe/ConnectionReset errors.
+
+    tv_main opens a new HTTP connection for every sensor read (170 Hz x 3 sensors
+    = 510 connections/sec) and closes them very quickly via the 30ms libcurl
+    timeout.  The server-side write occasionally races the client disconnect,
+    producing BrokenPipeError.  The data was already read successfully by the
+    client before the pipe broke — these errors are harmless noise.
+
+    Python 3.13 changed how socketserver propagates exceptions through
+    handle_error, so we check both sys.exc_info() and BaseException context.
+    """
+    def handle_error(self, request, client_address):
+        import sys, traceback
+        # Try current exception context first (Python 3.13+)
+        exc = sys.exc_info()[1]
+        if exc is None:
+            # Python 3.13 may store it differently — check __context__
+            try:
+                exc_type, exc, tb = sys.exc_info()
+            except Exception:
+                pass
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, OSError)):
+            # OSError errno 32 = Broken pipe, errno 104 = Connection reset
+            return  # Normal at 170 Hz — suppress completely
+        # Check by traceback string as fallback for Python 3.13
+        tb_str = traceback.format_exc()
+        if 'BrokenPipeError' in tb_str or 'ConnectionResetError' in tb_str:
+            return
+        super().handle_error(request, client_address)
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Josh Throttle Mock DAQ Server")
     ap.add_argument("--port", type=int, default=8050,
@@ -395,8 +447,8 @@ if __name__ == "__main__":
     print(f"[MockDAQ] Physics: Moonshine 2 orifice flow model at 170 Hz")
     print(f"[MockDAQ] Sensor endpoints:")
     for sid, title in SENSOR_TITLE_MAP.items():
-        print(f"  GET /api/v1/sensors/{sid}  → {title}")
+        print(f"  GET /api/v1/sensors/{sid}  \u2192 {title}")
     print(f"[MockDAQ] Set valve angles: POST /mock/valve_angles")
     print(f"[MockDAQ] Debug physics:    GET /mock/status")
 
-    HTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
+    QuietHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()

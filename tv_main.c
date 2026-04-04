@@ -157,6 +157,11 @@
 #include "tv_controller_2_1.h"
 #include "kzvalve_can.h"
 
+/* Suppress warn_unused_result on write() for GUI socket sends.
+ * Network writes to a client socket are best-effort — if the client
+ * disconnected we don't care about the partial write.               */
+#define GUI_WRITE(fd, buf, n)  do { ssize_t _w = write((fd),(buf),(n)); (void)_w; } while(0)
+
 /* ══════════════════════════════════════════════════════════════════════════
  * Configuration
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -303,7 +308,7 @@ static int can_open(const char *iface)
 
     /* Non-blocking receive */
     int flags = fcntl(can_sock, F_GETFL, 0);
-    fcntl(can_sock, F_SETFL, flags | O_NONBLOCK);
+    (void)fcntl(can_sock, F_SETFL, flags | O_NONBLOCK);
 
     printf("[CAN] Opened %s (fd=%d)\n", iface, can_sock);
     return 0;
@@ -320,9 +325,8 @@ static void can_send_address_claim(void)
 {
     struct can_frame f = {0};
     /* PGN 0xEE00, PS=0xFF (global), SA=Pi */
-    f.can_id  = (make_eid(EID_ADDR_CLAIM_BASE, J1939_ADDR_GLOBAL, KZVALVE_SA_PI)
-                 | CAN_EFF_FLAG);
-    /* Replace PS byte: set to global */
+    /* EID: Priority=6, EDP=0, DP=0, PF=0xEE, PS=0xFF (global broadcast), SA=0x01
+     * Assembled directly rather than via make_eid to set PS=global explicitly. */
     f.can_id  = ((6u<<26) | (0u<<25) | (0u<<24) | (0xEEu<<16) |
                  ((uint32_t)J1939_ADDR_GLOBAL<<8) | KZVALVE_SA_PI) | CAN_EFF_FLAG;
     f.can_dlc = 8;
@@ -558,19 +562,19 @@ static void gui_init(void)
 {
     gui_sock = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
-    setsockopt(gui_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    (void)setsockopt(gui_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_port   = htons(GUI_PORT),
         .sin_addr.s_addr = INADDR_ANY
     };
-    bind(gui_sock, (struct sockaddr *)&addr, sizeof(addr));
-    listen(gui_sock, 5);
+    (void)bind(gui_sock, (struct sockaddr *)&addr, sizeof(addr));
+    (void)listen(gui_sock, 5);
 
     /* Non-blocking */
     int flags = fcntl(gui_sock, F_GETFL, 0);
-    fcntl(gui_sock, F_SETFL, flags | O_NONBLOCK);
+    (void)fcntl(gui_sock, F_SETFL, flags | O_NONBLOCK);
 
     printf("[GUI] HTTP server on port %d\n", GUI_PORT);
 }
@@ -622,7 +626,7 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
         int n = snprintf(resp, sizeof(resp),
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n%s", json);
-        write(fd, resp, n);
+        GUI_WRITE(fd, resp, n);
         return;
     }
 
@@ -645,7 +649,7 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
         if (g_state.state == SYS_INIT_IC)
             g_state.state = SYS_READY;
         pthread_mutex_unlock(&state_mutex);
-        write(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 42);
+        GUI_WRITE(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 41);
         return;
     }
 
@@ -655,7 +659,7 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
         if (g_state.state == SYS_READY)
             g_state.state = SYS_ARMED;
         pthread_mutex_unlock(&state_mutex);
-        write(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 42);
+        GUI_WRITE(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 41);
         return;
     }
 
@@ -667,7 +671,7 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
             g_state.state = SYS_RUNNING;
         }
         pthread_mutex_unlock(&state_mutex);
-        write(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 42);
+        GUI_WRITE(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 41);
         return;
     }
 
@@ -679,7 +683,7 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
             g_state.state = SYS_READY;
         pthread_mutex_unlock(&state_mutex);
         can_drive_safe();
-        write(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 42);
+        GUI_WRITE(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 41);
         return;
     }
 
@@ -691,7 +695,7 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
         pthread_mutex_unlock(&state_mutex);
         can_drive_safe();
         fprintf(stderr, "[ESTOP] Emergency stop triggered from GUI\n");
-        write(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 42);
+        GUI_WRITE(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 41);
         return;
     }
 
@@ -713,7 +717,7 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
                 }
             }
         }
-        write(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 42);
+        GUI_WRITE(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 41);
         return;
     }
 
@@ -723,11 +727,11 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
         if (gf) {
             char hdr[] = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
                          "Connection: close\r\n\r\n";
-            write(fd, hdr, strlen(hdr));
+            GUI_WRITE(fd, hdr, strlen(hdr));
             char fbuf[4096];
             size_t nr;
             while ((nr = fread(fbuf, 1, sizeof(fbuf), gf)) > 0)
-                write(fd, fbuf, nr);
+                GUI_WRITE(fd, fbuf, nr);
             fclose(gf);
         } else {
             /* Fallback if gui.html not found */
@@ -738,7 +742,7 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
                               "<p>Open <a href=\"http://localhost:8080\" style=\"color:#00d4ff\">gui.html</a> "
                               "in the same directory as tv_main.</p>"
                               "</body></html>";
-            write(fd, msg, strlen(msg));
+            GUI_WRITE(fd, msg, strlen(msg));
         }
     }
 }
@@ -752,7 +756,7 @@ static void gui_poll(void)
 
     /* Set 100 ms receive timeout */
     struct timeval tv = {0, 100000};
-    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     char buf[2048] = {0};
     ssize_t n = read(cfd, buf, sizeof(buf) - 1);

@@ -91,7 +91,7 @@
  * // Parse incoming feedback frame:
  * uint8_t fmi = 0;
  * uint8_t actual_deg = kz_parse_position(&f, &fmi);
- * if (fmi != 0) { /* handle fault */ }
+ * if (fmi != 0) { // handle fault
  */
 
 #include <stdint.h>

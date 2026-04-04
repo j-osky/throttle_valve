@@ -68,7 +68,8 @@ import math
 import time
 import threading
 import requests
-import can   # python-can library: pip3 install python-can
+import can
+from typing import Optional, Tuple   # python-can library: pip3 install python-can
 
 # =============================================================================
 # J1939 ADDRESS CONSTANTS
@@ -82,7 +83,7 @@ SA_PI  = 0x01   # Pi ECU source address (1)
 # FRAME DETECTION: is_prop_a2_cmd
 # =============================================================================
 
-def is_prop_a2_cmd(msg) -> tuple | None:
+def is_prop_a2_cmd(msg) -> Optional[Tuple[int, int]]:
     """
     Determine whether a received CAN message is a Prop A2 Absolute Mode command
     directed at one of our simulated valves.

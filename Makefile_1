@@ -8,7 +8,7 @@ SRCS_COMMON = tv_controller_2_1.c tv_controller_2_1_data.c
 # tv_main        — standard 1-deg Prop A2 commands (round to nearest integer)
 # tv_main_dither — delta-sigma dithered commands (sub-degree effective resolution)
 
-all: tv_main tv_main_dither
+all: tv_main tv_main_dither tv_main_propa
 
 tv_main: tv_main.c $(SRCS_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -16,11 +16,14 @@ tv_main: tv_main.c $(SRCS_COMMON)
 tv_main_dither: tv_main_dither.c $(SRCS_COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+tv_main_propa: tv_main_propa.c $(SRCS_COMMON)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 # ── Mock stack helpers ──────────────────────────────────────────────────────
 vcan:
 	sudo modprobe vcan
-	sudo ip link add dev can0 type vcan 2>/dev/null || true
-	sudo ip link set up can0
+	sudo ip link add dev can1 type vcan 2>/dev/null || true
+	sudo ip link set up can1
 
 mock:
 	python3 mock_daq.py &
@@ -34,5 +37,8 @@ run: tv_main
 run-dither: tv_main_dither
 	sudo ./tv_main_dither
 
+run-propa: tv_main_propa
+	sudo ./tv_main_propa
+
 clean:
-	rm -f tv_main tv_main_dither
+	rm -f tv_main tv_main_dither tv_main_propa

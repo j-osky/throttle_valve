@@ -1,25 +1,16 @@
 /*
  * =============================================================================
- * tv_main_dither.c — Josh Throttle Valve Controller (Dithered CAN variant)
+ * tv_main_propa.c — Josh Throttle Valve Controller (Prop A percent mode)
  *
- * Identical to tv_main.c except can_send_valve_commands() uses first-order
- * delta-sigma dithering to achieve sub-degree effective resolution over the
- * 10 Hz CAN command rate.  The valve still receives integer degree commands
- * (Prop A2 protocol), but the pattern of commands averages to the fractional
- * target over multiple CAN cycles.
+ * Identical to tv_main.c except valve commands use Prop A (DP=0, percent of
+ * full open) instead of Prop A2 (DP=1, degrees).  The controller still works
+ * in degrees internally — conversion happens only at the CAN send/receive
+ * boundary:
+ *   Command:  deg → pct = round(deg / 90.0 * 100.0), sent as data[0] 0-100
+ *   Feedback: pct → deg = pct * 90.0 / 100.0, stored as actual_deg float
  *
- * Example: controller outputs 41.4°
- *   Cycle 1: send 41°  (acc = +0.4)
- *   Cycle 2: send 42°  (acc = -0.2)
- *   Cycle 3: send 41°  (acc = +0.2)
- *   Cycle 4: send 42°  (acc = -0.4)
- *   Cycle 5: send 41°  (acc =  0.0)
- *   Average: 41.4° — exact.
- *
- * This reduces thrust_est quantization noise from ±4.6 lbf to ~±0.5 lbf
- * at the cost of the valve physically dithering ±1° at ~2 Hz.  Whether the
- * real EH22 valve responds fast enough to follow this dither pattern depends
- * on the mechanical load — on the bench with the mock it works well.
+ * Effective resolution: 1% × 90° = 0.9°/count — marginally coarser than
+ * Prop A2's 1°/count.  Use tv_main_dither.c for finer effective resolution.
  *
  * Original file: tv_main.c
  * =============================================================================
@@ -178,6 +169,35 @@
 
 #include "tv_controller_2_1.h"
 #include "kzvalve_can.h"
+
+/* ── Prop A (percent mode) EID and frame builder ─────────────────────────── *
+ * Prop A uses DP=0: EID base = (6<<26)|(0<<25)|(0<<24)|(0xEF<<16)           *
+ *                            = 0x18EF0000                                    *
+ * data[0] = position as percent of full open (0-100)                        *
+ * data[1] = motor speed % (50-100)                                           *
+ * data[2] = 0xFF reserved                                                    *
+ * data[3] = MODE_ABSOLUTE (0x00)                                             *
+ * data[4-7] = 0xFF reserved                                                  *
+ * The periodic config (Mode 5) is still sent on Prop A2 per KZValve manual. */
+#define EID_PROP_A_BASE     0x18EF0000u  /* Prop A (percent), DP=0 */
+
+static inline struct can_frame kz_build_absolute_pct(
+        uint8_t dest_sa, uint8_t src_sa,
+        uint8_t pct, uint8_t speed_pct)
+{
+    struct can_frame f = {0};
+    f.can_id  = (EID_PROP_A_BASE | ((uint32_t)dest_sa << 8) | src_sa) | CAN_EFF_FLAG;
+    f.can_dlc = 8;
+    f.data[0] = pct < 100 ? pct : 100;   /* percent 0-100 */
+    f.data[1] = speed_pct < 50 ? 50 : (speed_pct > 100 ? 100 : speed_pct);
+    f.data[2] = 0xFF;
+    f.data[3] = MODE_ABSOLUTE;            /* 0x00 */
+    f.data[4] = 0xFF;
+    f.data[5] = 0xFF;
+    f.data[6] = 0xFF;
+    f.data[7] = 0xFF;
+    return f;
+}
 
 /* Suppress warn_unused_result on write() for GUI socket sends.
  * Network writes to a client socket are best-effort — if the client
@@ -396,61 +416,26 @@ static void can_configure_periodic(void)
            CAN_PERIOD_MS);
 }
 
-/* ── Send absolute degree command to both valves (delta-sigma dithered) ─────
- *
- * Uses first-order delta-sigma modulation to achieve sub-degree effective
- * resolution despite the Prop A2 protocol's integer degree constraint.
- *
- * A fractional error accumulator is maintained per valve.  Each call:
- *   1. Add the previous fractional error to the current target
- *   2. Round to the nearest integer — this is the actual CAN command
- *   3. Store the remaining fractional error for next call
- *
- * Long-term average of the integer commands equals the true floating-point
- * target.  At 10 Hz CAN rate, the valve physically follows the dither pattern
- * because each ±1° step takes only ~17ms to execute at 60 deg/s, well within
- * the 100ms CAN period.
- *
- * Example: target = 41.4° constant
- *   Call 1: acc=0.0  → inp=41.4 → out=41 → acc=+0.4
- *   Call 2: acc=0.4  → inp=41.8 → out=42 → acc=-0.2
- *   Call 3: acc=-0.2 → inp=41.2 → out=41 → acc=+0.2
- *   Call 4: acc=0.2  → inp=41.6 → out=42 → acc=-0.4
- *   Call 5: acc=-0.4 → inp=41.0 → out=41 → acc= 0.0  (repeats)
- *   Average = (41+42+41+42+41)/5 = 41.4° ✓
- * ─────────────────────────────────────────────────────────────────────────── */
+/* ── Send absolute percent command to both valves (Prop A mode) ──────────── *
+ * Converts the controller's degree output to percent of full open (0-100).  *
+ * 1 count = 0.9 deg effective resolution (1% × 90°).                       */
 static void can_send_valve_commands(double lox_deg, double ipa_deg)
 {
-    /* Per-valve fractional accumulators — persist across calls */
-    static double lox_acc = 0.0;
-    static double ipa_acc = 0.0;
-
-    /* Clamp inputs to physical range before accumulating */
+    /* Clamp degrees to physical range, convert to percent */
     lox_deg = fmax(VALVE_MIN_DEG, fmin(VALVE_MAX_DEG, lox_deg));
     ipa_deg = fmax(VALVE_MIN_DEG, fmin(VALVE_MAX_DEG, ipa_deg));
 
-    /* Delta-sigma: add accumulated error, round, store residual */
-    double lox_inp = lox_deg + lox_acc;
-    double ipa_inp = ipa_deg + ipa_acc;
-
-    /* Clamp again after adding accumulator to prevent runaway */
-    lox_inp = fmax(VALVE_MIN_DEG, fmin(VALVE_MAX_DEG, lox_inp));
-    ipa_inp = fmax(VALVE_MIN_DEG, fmin(VALVE_MAX_DEG, ipa_inp));
-
-    uint8_t lox = (uint8_t)round(lox_inp);
-    uint8_t ipa = (uint8_t)round(ipa_inp);
-
-    lox_acc = lox_inp - (double)lox;
-    ipa_acc = ipa_inp - (double)ipa;
+    uint8_t lox_pct = (uint8_t)round(lox_deg / VALVE_MAX_DEG * 100.0);
+    uint8_t ipa_pct = (uint8_t)round(ipa_deg / VALVE_MAX_DEG * 100.0);
 
     struct can_frame f;
 
-    f = kz_build_absolute_deg(KZVALVE_SA_LOX, KZVALVE_SA_PI,
-                               lox, MOTOR_SPEED_PCT);
+    f = kz_build_absolute_pct(KZVALVE_SA_LOX, KZVALVE_SA_PI,
+                               lox_pct, MOTOR_SPEED_PCT);
     can_send_frame(&f);
 
-    f = kz_build_absolute_deg(KZVALVE_SA_IPA, KZVALVE_SA_PI,
-                               ipa, MOTOR_SPEED_PCT);
+    f = kz_build_absolute_pct(KZVALVE_SA_IPA, KZVALVE_SA_PI,
+                               ipa_pct, MOTOR_SPEED_PCT);
     can_send_frame(&f);
 }
 
@@ -461,9 +446,9 @@ static void can_drive_safe(void)
      * it fires only once per transition into safe state, not 170x/sec.     */
     static SystemState last_safe_state = (SystemState)-1;  /* sentinel: no state yet */
     struct can_frame f;
-    f = kz_build_absolute_deg(KZVALVE_SA_LOX, KZVALVE_SA_PI, 0, 100);
+    f = kz_build_absolute_pct(KZVALVE_SA_LOX, KZVALVE_SA_PI, 0, 100);
     can_send_frame(&f);
-    f = kz_build_absolute_deg(KZVALVE_SA_IPA, KZVALVE_SA_PI, 0, 100);
+    f = kz_build_absolute_pct(KZVALVE_SA_IPA, KZVALVE_SA_PI, 0, 100);
     can_send_frame(&f);
 
     pthread_mutex_lock(&state_mutex);
@@ -491,17 +476,20 @@ static void can_process_rx(void)
          * This prevents misinterpreting other CAN traffic as position feedback.
          * DLC must be 8 and the frame must not be an error frame.          */
         bool is_known_valve = (sa == KZVALVE_SA_LOX || sa == KZVALVE_SA_IPA);
-        if ((pgn & 0x1FF00u) == 0x1EF00u && is_known_valve && f.can_dlc == 8) {
+        /* Prop A feedback uses DP=0 → PGN 0x00EF00.
+         * data[2] carries actual position as percent (0-100); convert to deg. */
+        if ((pgn & 0x1FF00u) == 0x0EF00u && is_known_valve && f.can_dlc == 8) {
             uint8_t fmi = 0;
-            uint8_t pos = kz_parse_position(&f, &fmi);
+            uint8_t pos_pct = kz_parse_position(&f, &fmi);   /* 0-100 % */
+            uint8_t pos_deg = (uint8_t)round(pos_pct * 90.0 / 100.0);
 
             pthread_mutex_lock(&state_mutex);
             if (sa == KZVALVE_SA_LOX) {
-                g_state.lox_actual_deg = pos;
+                g_state.lox_actual_deg = pos_deg;
                 g_state.lox_fmi        = fmi;
                 g_state.lox_on_bus     = true;
             } else if (sa == KZVALVE_SA_IPA) {
-                g_state.ipa_actual_deg = pos;
+                g_state.ipa_actual_deg = pos_deg;
                 g_state.ipa_fmi        = fmi;
                 g_state.ipa_on_bus     = true;
             }

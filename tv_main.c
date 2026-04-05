@@ -68,11 +68,12 @@
  *             CAN commands.  Operator can ARM or use Init ICs from this state.
  *             This is the safe resting state between operations.
  *
- *   INIT_IC → Transient: a one-shot Prop A2 command is sent driving both
- *             valves to THETA_O (LOX) and THETA_F (IPA) — the 500 lbf
+ *   INIT_IC → Operator-triggered: a one-shot Prop A2 command is sent driving
+ *             both valves to THETA_O (LOX) and THETA_F (IPA) — the 500 lbf
  *             initial conditions that match the Simulink integrator ICs.
- *             Returns to READY immediately after sending the command.
- *             The valves physically slew at ~60 deg/s; monitor in GUI.
+ *             Triggered from GUI after the operator has verified CAN comms
+ *             (actual positions readable, FMI=0).  Returns to READY after
+ *             the command is sent.  Valves slew at ~60 deg/s; monitor GUI.
  *
  *   ARMED   → Operator has confirmed the system is ready to fire.
  *             Controller still computing but CAN commands still NOT sent.
@@ -261,6 +262,8 @@ typedef struct {
     double      mr_est;
     double      thrust_est_lbf;
     double      pom_set_psi;
+    double      lox_mdot_kgs;   /* LOX mass flow estimate (kg/s) */
+    double      ipa_mdot_kgs;   /* IPA mass flow estimate (kg/s) */
 
     /* Sensor readings (from DAQstra) */
     double      pom_psi;
@@ -379,7 +382,7 @@ static void can_drive_safe(void)
 {
     /* Send 0-degree command to both valves.  The printf is rate-limited so
      * it fires only once per transition into safe state, not 170x/sec.     */
-    static SystemState last_safe_state = -1;
+    static SystemState last_safe_state = (SystemState)-1;  /* sentinel: no state yet */
     struct can_frame f;
     f = kz_build_absolute_deg(KZVALVE_SA_LOX, KZVALVE_SA_PI, 0, 100);
     can_send_frame(&f);
@@ -466,39 +469,45 @@ static size_t curl_write_cb(void *data, size_t sz, size_t n, void *userp)
     return add;
 }
 
-/* daqstra_get_by_id — fetch the latest sensor value from DAQstra REST API.
+/* daqstra_init_handle — configure a persistent CURL handle for one sensor.
+ * Call once at startup per handle.  The URL is fixed per-handle so we never
+ * need to update it.  Never call curl_easy_reset() on these handles — that
+ * drops the keep-alive TCP connection and forces a new handshake every tick.
  *
- * Called at 170 Hz (every Simulink tick) for each of the three PT sensors.
- * Uses a 30 ms libcurl timeout so a slow DAQstra response does not cause a
- * controller overrun (170 Hz tick period = 5.88 ms, but the sensor read is
- * allowed to straddle multiple ticks given the non-real-time nature of HTTP).
- * If the fetch fails or times out, NAN is returned and the caller substitutes 0.
- *
- * @sensor_id: URL-encoded DAQstra sensor ID string.
- *             The # character in DAQstra IDs (e.g. b1_log_data_ads1256#0)
- *             MUST be encoded as %23 in the URL path:
- *             → b1_log_data_ads1256%230
- *             This is handled by the SENSOR_ID_* defines which already
- *             contain the %23 encoding.
- * Returns: latest_value as double, or NAN on any error.
- */
+ * NOTE: CURLOPT_URL requires the URL string to remain valid for the lifetime
+ * of the handle.  We store it in a static per-call buffer using a file-scope
+ * array indexed by call order (POM=0, PFM=1, PC=2).                        */
+#define DAQSTRA_MAX_URL 512
+static char s_daqstra_urls[3][DAQSTRA_MAX_URL];  /* persistent URL storage  */
+static int  s_daqstra_url_idx = 0;               /* next slot to allocate   */
+
+static void daqstra_init_handle(CURL *c, const char *sensor_id)
+{
+    /* Claim a persistent URL slot — must be called at most 3 times         */
+    char *url = s_daqstra_urls[s_daqstra_url_idx++];
+    snprintf(url, DAQSTRA_MAX_URL, DAQSTRA_BASE "/api/v1/sensors/%s", sensor_id);
+    curl_easy_setopt(c, CURLOPT_URL,           url);   /* points to static buffer */
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS,    30L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL,      1L);
+    /* Keep-alive: reuse the TCP connection across 170 Hz requests           */
+    curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(c, CURLOPT_TCP_KEEPIDLE,  5L);
+    curl_easy_setopt(c, CURLOPT_TCP_KEEPINTVL, 2L);
+}
+
+/* daqstra_get — fetch one sensor value using a pre-initialised handle.
+ * The URL is already set; we only update WRITEDATA per call.              */
 static double daqstra_get_by_id(CURL *curl, const char *sensor_id)
 {
-    char url[512];
-    snprintf(url, sizeof(url),
-             DAQSTRA_BASE "/api/v1/sensors/%s", sensor_id);
+    (void)sensor_id;   /* URL already baked into handle by daqstra_init_handle */
 
     CurlBuf body = {NULL, 0};
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 30L);   /* 30 ms timeout */
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
     CURLcode rc = curl_easy_perform(curl);
     double val = NAN;
     if (rc == CURLE_OK && body.buf) {
-        /* Quick JSON parse: find "latest_value": <number> */
         char *p = strstr(body.buf, "\"latest_value\"");
         if (p) {
             p = strchr(p, ':');
@@ -506,7 +515,7 @@ static double daqstra_get_by_id(CURL *curl, const char *sensor_id)
         }
     }
     free(body.buf);
-    curl_easy_reset(curl);
+    /* Do NOT call curl_easy_reset() — that drops the keep-alive connection */
     return val;
 }
 
@@ -516,6 +525,10 @@ static double daqstra_get_by_id(CURL *curl, const char *sensor_id)
  * ══════════════════════════════════════════════════════════════════════════ */
 static bool valve_init_sequence(void)
 {
+    /* Wait for both valve address claims (up to 5 s).
+     * No valve commands are sent here — the operator must first verify
+     * CAN comms via the GUI (actual positions, FMI=0, both on bus),
+     * then press Init ICs when ready to move valves to THETA_O/THETA_F. */
     printf("[INIT] Waiting for valve address claims (up to 5s)...\n");
     for (int i = 0; i < 100; i++) {       /* 100 × 50 ms = 5 s */
         can_process_rx();
@@ -532,39 +545,19 @@ static bool valve_init_sequence(void)
     pthread_mutex_unlock(&state_mutex);
 
     if (!ok) {
-        fprintf(stderr, "[INIT] ERROR: Not all valves found on bus\n");
+        fprintf(stderr, "[INIT] WARNING: Not all valves found on bus — "
+                        "check CAN wiring.  Continuing anyway.\n");
         return false;
     }
     printf("[INIT] Both valves on bus\n");
 
-    /* Configure periodic feedback at 100 ms */
+    /* Configure periodic position broadcast at 100 ms */
     can_configure_periodic();
     usleep(50000);
 
-    /* Drive valves to Simulink initial conditions */
-    printf("[INIT] Moving valves to ICs: LOX=%.1f° IPA=%.1f°\n",
-           THETA_O, THETA_F);
-    can_send_valve_commands(THETA_O, THETA_F);
-
-    /* Wait for valves to reach IC positions (max 3 s) */
-    for (int i = 0; i < 60; i++) {
-        can_process_rx();
-        pthread_mutex_lock(&state_mutex);
-        bool lox_ok = abs((int)g_state.lox_actual_deg - (int)THETA_O) <= 2;
-        bool ipa_ok = abs((int)g_state.ipa_actual_deg - (int)THETA_F) <= 2;
-        pthread_mutex_unlock(&state_mutex);
-        if (lox_ok && ipa_ok) {
-            printf("[INIT] Valves at IC positions\n");
-            return true;
-        }
-        usleep(50000);
-    }
-
-    /* Not converged but not fatal — continue with warning */
-    pthread_mutex_lock(&state_mutex);
-    printf("[INIT] WARNING: LOX actual=%u° IPA actual=%u° (target ~41°/41°)\n",
-           g_state.lox_actual_deg, g_state.ipa_actual_deg);
-    pthread_mutex_unlock(&state_mutex);
+    /* Valves stay at their current physical position.
+     * Press Init ICs in the GUI when ready to slew to THETA_O/THETA_F. */
+    printf("[INIT] CAN ready. Verify valve positions in GUI, then press Init ICs.\n");
     return true;
 }
 
@@ -617,6 +610,8 @@ static void gui_build_status_json(char *buf, size_t sz)
     s.pc_psi         = jsafe(s.pc_psi);
     s.pom_set_psi    = jsafe(s.pom_set_psi);
     s.loop_dt_ms     = jsafe(s.loop_dt_ms);
+    s.lox_mdot_kgs   = jsafe(s.lox_mdot_kgs);
+    s.ipa_mdot_kgs   = jsafe(s.ipa_mdot_kgs);
 
     snprintf(buf, sz,
         "{"
@@ -629,7 +624,8 @@ static void gui_build_status_json(char *buf, size_t sz)
         "\"mr_est\":%.4f,"
         "\"tick_count\":%llu,\"can_send_count\":%llu,"
         "\"overrun_count\":%llu,\"loop_dt_ms\":%.3f,"
-        "\"lox_on_bus\":%s,\"ipa_on_bus\":%s"
+        "\"lox_on_bus\":%s,\"ipa_on_bus\":%s,"
+        "\"lox_mdot_kgs\":%.4f,\"ipa_mdot_kgs\":%.4f"
         "}",
         state_names[s.state],
         s.lox_cmd_deg, s.lox_actual_deg, s.lox_fmi,
@@ -643,7 +639,9 @@ static void gui_build_status_json(char *buf, size_t sz)
         (unsigned long long)s.overrun_count,
         s.loop_dt_ms,
         s.lox_on_bus ? "true" : "false",
-        s.ipa_on_bus ? "true" : "false"
+        s.ipa_on_bus ? "true" : "false",
+        s.lox_mdot_kgs,
+        s.ipa_mdot_kgs
     );
 }
 
@@ -780,11 +778,6 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
     }
 }
 
-/* gui_poll() is now a no-op — the GUI server runs in its own thread.
- * gui_thread() below does the accept/read/respond loop without blocking
- * the 170 Hz control loop at all.                                       */
-static void gui_poll(void) { /* intentionally empty */ }
-
 static void *gui_thread(void *arg)
 {
     (void)arg;
@@ -852,9 +845,20 @@ int main(void)
     signal(SIGTERM, sig_handler);
 
     /* ── Initialise libcurl ─────────────────────────────────────────────── */
+    /* One persistent CURL handle per sensor so TCP connections are reused
+     * across calls.  curl_easy_reset() clears keep-alive state, so we never
+     * call it — we just update CURLOPT_URL before each perform().           */
     curl_global_init(CURL_GLOBAL_ALL);
-    CURL *curl = curl_easy_init();
-    if (!curl) { fprintf(stderr, "curl_easy_init failed\n"); return 1; }
+    CURL *curl_pom = curl_easy_init();
+    CURL *curl_pfm = curl_easy_init();
+    CURL *curl_pc  = curl_easy_init();
+    if (!curl_pom || !curl_pfm || !curl_pc) {
+        fprintf(stderr, "curl_easy_init failed\n"); return 1;
+    }
+    /* Configure each handle with its fixed URL and keep-alive settings */
+    daqstra_init_handle(curl_pom, SENSOR_ID_POM);
+    daqstra_init_handle(curl_pfm, SENSOR_ID_PFM);
+    daqstra_init_handle(curl_pc,  SENSOR_ID_PC);
 
     /* ── Open CAN bus ───────────────────────────────────────────────────── */
     if (can_open(CAN_IFACE) < 0) {
@@ -916,9 +920,9 @@ int main(void)
          * period — this is acceptable because the Simulink FIR filter       *
          * (10-tap moving average) smooths out occasional stale readings.    *
          * In practice the DAQstra API responds in <1ms on localhost.        */
-        double pom = daqstra_get_by_id(curl, SENSOR_ID_POM);
-        double pfm = daqstra_get_by_id(curl, SENSOR_ID_PFM);
-        double pc  = daqstra_get_by_id(curl, SENSOR_ID_PC);
+        double pom = daqstra_get_by_id(curl_pom, SENSOR_ID_POM);
+        double pfm = daqstra_get_by_id(curl_pfm, SENSOR_ID_PFM);
+        double pc  = daqstra_get_by_id(curl_pc,  SENSOR_ID_PC);
 
         /* Fallback to zero if sensor unreachable (will show in GUI) */
         if (isnan(pom)) pom = 0.0;
@@ -941,19 +945,33 @@ int main(void)
         tv_controller_2_1_U.pc_psi_inport          = pc;
         tv_controller_2_1_U.pfm_psi_inport         = pfm;
 
-        /* ── 4. Step controller ──────────────────────────────────────────── */
-        tv_controller_2_1_step();
-
-        double lox_cmd = tv_controller_2_1_Y.lox_deg_outport;
-        double ipa_cmd = tv_controller_2_1_Y.ipa_deg_outport;
+        /* ── 4. Step controller ──────────────────────────────────────────── *
+         * Only run the Simulink model (and use its outputs) when RUNNING.   *
+         * In any other state we hold commanded angles at the IC values so   *
+         * the PI integrators cannot wind up due to zero sensor readings.    */
+        double lox_cmd, ipa_cmd;
+        if (ctrl_en) {
+            tv_controller_2_1_step();
+            lox_cmd = tv_controller_2_1_Y.lox_deg_outport;
+            ipa_cmd = tv_controller_2_1_Y.ipa_deg_outport;
+        } else {
+            /* Freeze outputs at ICs — do not call step() to prevent wind-up */
+            lox_cmd = THETA_O;
+            ipa_cmd = THETA_F;
+        }
 
         /* ── 5. Update shared state with controller outputs ─────────────── */
         pthread_mutex_lock(&state_mutex);
         g_state.lox_cmd_deg     = lox_cmd;
         g_state.ipa_cmd_deg     = ipa_cmd;
-        g_state.mr_est          = tv_controller_2_1_Y.mr_outport;
-        g_state.thrust_est_lbf  = tv_controller_2_1_Y.thrust_lbf_est_outport;
-        g_state.pom_set_psi     = tv_controller_2_1_Y.pom_psi_set_outport;
+        if (ctrl_en) {
+            /* Only update estimated quantities when controller is active */
+            g_state.mr_est         = tv_controller_2_1_Y.mr_outport;
+            g_state.thrust_est_lbf = tv_controller_2_1_Y.thrust_lbf_est_outport;
+            g_state.pom_set_psi    = tv_controller_2_1_Y.pom_psi_set_outport;
+            g_state.lox_mdot_kgs   = tv_controller_2_1_Y.lox_mdot_kgs_outport;
+            g_state.ipa_mdot_kgs   = tv_controller_2_1_Y.ipa_mdot_kgs_outport;
+        }
         g_state.tick_count++;
         pthread_mutex_unlock(&state_mutex);
 
@@ -970,8 +988,7 @@ int main(void)
             }
         }
 
-        /* ── 7. GUI poll — handled by gui_thread() (pthread) ─────────────── */
-        /* gui_poll() intentionally empty; GUI runs in background thread     */
+        /* ── 7. GUI runs in gui_thread() pthread — nothing to do here ──────── */
 
         /* ── 8. Fault → safe state ───────────────────────────────────────── */
         pthread_mutex_lock(&state_mutex);
@@ -1004,7 +1021,9 @@ int main(void)
     close(gui_sock);
 
     tv_controller_2_1_terminate();
-    curl_easy_cleanup(curl);
+    curl_easy_cleanup(curl_pom);
+    curl_easy_cleanup(curl_pfm);
+    curl_easy_cleanup(curl_pc);
     curl_global_cleanup();
     close(can_sock);
 

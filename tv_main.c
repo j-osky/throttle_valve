@@ -129,7 +129,7 @@
  * ------------
  *   libcurl:     sudo apt-get install libcurl4-openssl-dev
  *   SocketCAN:   sudo apt-get install can-utils
- *   CAN bus up:  sudo ip link set can0 up type can bitrate 250000
+ *   CAN bus up:  sudo ip link set can1 up type can bitrate 250000
  */
 
 #define _GNU_SOURCE
@@ -181,7 +181,7 @@
 #define GUI_PORT            8080        /* HTTP server port for gui.html and
                                          * /api/status JSON endpoint.          */
 #define DAQSTRA_BASE        "http://localhost:8050"
-#define CAN_IFACE           "can0"
+#define CAN_IFACE           "can1"
 
 /* DAQstra sensor IDs — use exact sensor_id from /api/v1/sensors
  * Example IDs from b1_log_data_ads1256 board (ADS1256 ADC channels).

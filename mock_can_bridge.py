@@ -7,7 +7,7 @@ mock_can_bridge.py — Josh Throttle Mock CAN Bridge
 PURPOSE
 -------
 This script is the third component of the bench test mock stack.  It sits
-between tv_main.c (which talks to can0) and mock_daq.py (which serves
+between tv_main.c (which talks to can1) and mock_daq.py (which serves
 sensor data) and makes both of them think they are talking to real hardware.
 
 WHAT IT SIMULATES
@@ -36,16 +36,16 @@ CLOSED-LOOP DATA FLOW (bench testing)
   tv_main (170 Hz)
     ├─ Reads POM/PFM/PC from mock_daq.py (HTTP)
     ├─ Runs tv_controller_2_1_step()
-    └─ Every 17th tick (10 Hz): sends Prop A2 command to can0
-           ↓ CAN frame on can0
+    └─ Every 17th tick (10 Hz): sends Prop A2 command to can1
+           ↓ CAN frame on can1
   mock_can_bridge (this script)
     ├─ Parses commanded angle from Byte 1
     ├─ Slews simulated valve at 60 deg/s toward command
     ├─ Posts actual valve angles to mock_daq.py (HTTP, 10 Hz)
     │      ↓ HTTP POST /mock/valve_angles
     │  mock_daq.py recomputes POM/PFM/PC from new angles
-    └─ Sends Prop A2 feedback frame back to can0
-           ↓ CAN frame on can0
+    └─ Sends Prop A2 feedback frame back to can1
+           ↓ CAN frame on can1
   tv_main receives feedback, logs actual position, checks FMI
   (loop continues...)
 
@@ -55,12 +55,12 @@ REQUIREMENTS
 
 USAGE
 -----
-  python3 mock_can_bridge.py [--iface can0] [--daq http://localhost:8050]
+  python3 mock_can_bridge.py [--iface can1] [--daq http://localhost:8050]
 
-  Default interface is can0.  Use vcan0/can0 virtual interface for bench:
+  Default interface is can1.  Use vcan1/can1 virtual interface for bench:
     sudo modprobe vcan
-    sudo ip link add dev can0 type vcan
-    sudo ip link set up can0
+    sudo ip link add dev can1 type vcan
+    sudo ip link set up can1
 """
 
 import argparse
@@ -394,8 +394,8 @@ class MockCANBridge:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Josh Throttle Mock CAN Bridge")
-    ap.add_argument("--iface", default="can0",
-                    help="SocketCAN interface name (default: can0)")
+    ap.add_argument("--iface", default="can1",
+                    help="SocketCAN interface name (default: can1)")
     ap.add_argument("--daq",   default="http://localhost:8050",
                     help="mock_daq.py base URL (default: http://localhost:8050)")
     args = ap.parse_args()

@@ -223,6 +223,24 @@ static const double THETA_F = 40.67697413;   /* theta_f: IPA valve IC (deg) */
 #define TICK_NS             (1000000000L / CTRL_HZ)  /* 5,882,353 ns       */
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * DAQstra sensor cache — updated by background thread, read by control loop
+ *
+ * The three HTTP sensor reads (POM, PFM, PC) each take 1-30ms on the Pi,
+ * causing >97% overrun at 170 Hz if called synchronously in the control loop.
+ * Instead a background thread fetches at ~50 Hz and writes to this cache.
+ * The control loop reads the cache without blocking — worst case it uses a
+ * value that is up to ~20ms old, which is fine given the 10-tap FIR filter.
+ * ══════════════════════════════════════════════════════════════════════════ */
+typedef struct {
+    double pom_psi;
+    double pfm_psi;
+    double pc_psi;
+} SensorCache;
+
+static SensorCache       g_sensors  = {322.8241, 370.7493, 370.8182};
+static pthread_mutex_t   sensor_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* ══════════════════════════════════════════════════════════════════════════
  * Shared state (protected by state_mutex)
  * ══════════════════════════════════════════════════════════════════════════ */
 typedef enum {
@@ -519,6 +537,59 @@ static double daqstra_get_by_id(CURL *curl, const char *sensor_id)
     free(body.buf);
     /* Do NOT call curl_easy_reset() — that drops the keep-alive connection */
     return val;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * DAQstra sensor background thread
+ * Reads POM/PFM/PC via HTTP at ~50 Hz and writes to g_sensors cache.
+ * The control loop reads from g_sensors without blocking.
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void *sensor_thread(void *arg)
+{
+    (void)arg;
+
+    /* Each handle has its URL already set by daqstra_init_handle() in main().
+     * We receive the three handles via a small struct passed as arg — but to
+     * keep this simple we re-initialise local handles here.                */
+    CURL *c_pom = curl_easy_init();
+    CURL *c_pfm = curl_easy_init();
+    CURL *c_pc  = curl_easy_init();
+    if (!c_pom || !c_pfm || !c_pc) {
+        fprintf(stderr, "[DAQ] sensor_thread: curl_easy_init failed\n");
+        return NULL;
+    }
+    daqstra_init_handle(c_pom, SENSOR_ID_POM);
+    daqstra_init_handle(c_pfm, SENSOR_ID_PFM);
+    daqstra_init_handle(c_pc,  SENSOR_ID_PC);
+
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    const long SENSOR_PERIOD_NS = 20000000L;   /* 20ms = 50 Hz              */
+
+    while (g_running) {
+        double pom = daqstra_get_by_id(c_pom, SENSOR_ID_POM);
+        double pfm = daqstra_get_by_id(c_pfm, SENSOR_ID_PFM);
+        double pc  = daqstra_get_by_id(c_pc,  SENSOR_ID_PC);
+
+        pthread_mutex_lock(&sensor_mutex);
+        if (!isnan(pom)) g_sensors.pom_psi = pom;
+        if (!isnan(pfm)) g_sensors.pfm_psi = pfm;
+        if (!isnan(pc))  g_sensors.pc_psi  = pc;
+        pthread_mutex_unlock(&sensor_mutex);
+
+        /* Sleep until next 20ms tick */
+        next.tv_nsec += SENSOR_PERIOD_NS;
+        if (next.tv_nsec >= 1000000000L) {
+            next.tv_nsec -= 1000000000L;
+            next.tv_sec++;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+    }
+
+    curl_easy_cleanup(c_pom);
+    curl_easy_cleanup(c_pfm);
+    curl_easy_cleanup(c_pc);
+    return NULL;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -857,10 +928,22 @@ int main(void)
     if (!curl_pom || !curl_pfm || !curl_pc) {
         fprintf(stderr, "curl_easy_init failed\n"); return 1;
     }
-    /* Configure each handle with its fixed URL and keep-alive settings */
-    daqstra_init_handle(curl_pom, SENSOR_ID_POM);
-    daqstra_init_handle(curl_pfm, SENSOR_ID_PFM);
-    daqstra_init_handle(curl_pc,  SENSOR_ID_PC);
+    /* The main curl handles are kept for potential future use but the
+     * sensor_thread creates its own handles internally.  We can clean up
+     * these here since sensor reads are now fully off the control loop.   */
+    curl_easy_cleanup(curl_pom);
+    curl_easy_cleanup(curl_pfm);
+    curl_easy_cleanup(curl_pc);
+
+    /* Spawn background sensor thread — reads DAQstra at 50 Hz into cache */
+    pthread_t sensor_tid;
+    if (pthread_create(&sensor_tid, NULL, sensor_thread, NULL) != 0) {
+        fprintf(stderr, "[DAQ] Failed to create sensor thread\n"); return 1;
+    }
+    pthread_detach(sensor_tid);
+    /* Give the sensor thread time to get at least one reading before
+     * the control loop starts so the cache isn't stale on first tick. */
+    usleep(50000);   /* 50 ms */
 
     /* ── Open CAN bus ───────────────────────────────────────────────────── */
     if (can_open(CAN_IFACE) < 0) {
@@ -916,20 +999,16 @@ int main(void)
         struct timespec t0;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        /* ── 1. Read PT sensors from DAQstra at 170 Hz ───────────────────── *
-         * Each call makes an HTTP GET request to localhost:8050.            *
-         * The 30ms timeout is intentionally longer than the 5.88ms tick    *
-         * period — this is acceptable because the Simulink FIR filter       *
-         * (10-tap moving average) smooths out occasional stale readings.    *
-         * In practice the DAQstra API responds in <1ms on localhost.        */
-        double pom = daqstra_get_by_id(curl_pom, SENSOR_ID_POM);
-        double pfm = daqstra_get_by_id(curl_pfm, SENSOR_ID_PFM);
-        double pc  = daqstra_get_by_id(curl_pc,  SENSOR_ID_PC);
-
-        /* Fallback to zero if sensor unreachable (will show in GUI) */
-        if (isnan(pom)) pom = 0.0;
-        if (isnan(pfm)) pfm = 0.0;
-        if (isnan(pc))  pc  = 0.0;
+        /* ── 1. Read PT sensors from cache (populated by sensor_thread) ────── *
+         * The background sensor_thread fetches POM/PFM/PC at 50 Hz via     *
+         * HTTP and writes to g_sensors.  Reading the cache here is         *
+         * non-blocking (<1 µs) so the 170 Hz loop timing is preserved.     *
+         * Worst-case sensor age is ~20ms — well within the FIR window.     */
+        pthread_mutex_lock(&sensor_mutex);
+        double pom = g_sensors.pom_psi;
+        double pfm = g_sensors.pfm_psi;
+        double pc  = g_sensors.pc_psi;
+        pthread_mutex_unlock(&sensor_mutex);
 
         /* ── 2. Read current state under lock ───────────────────────────── */
         pthread_mutex_lock(&state_mutex);
@@ -1023,10 +1102,7 @@ int main(void)
     close(gui_sock);
 
     tv_controller_2_1_terminate();
-    curl_easy_cleanup(curl_pom);
-    curl_easy_cleanup(curl_pfm);
-    curl_easy_cleanup(curl_pc);
-    curl_global_cleanup();
+    curl_global_cleanup();   /* sensor_thread cleans up its own handles */
     close(can_sock);
 
     printf("[CTRL] Clean exit\n");

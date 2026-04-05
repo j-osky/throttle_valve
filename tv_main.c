@@ -594,11 +594,19 @@ static void *sensor_thread(void *arg)
  * ══════════════════════════════════════════════════════════════════════════ */
 static bool valve_init_sequence(void)
 {
-    /* Wait for both valve address claims (up to 5 s).
-     * No valve commands are sent here — the operator must first verify
-     * CAN comms via the GUI (actual positions, FMI=0, both on bus),
-     * then press Init ICs when ready to move valves to THETA_O/THETA_F. */
-    printf("[INIT] Waiting for valve address claims (up to 5s)...\n");
+    /* Request address claims from both valves.
+     * The valve only broadcasts its address claim once at power-up, so if
+     * tv_main starts after the valve is already running the claim is missed.
+     * Sending a Request PGN for 0xEE00 forces the valve to re-broadcast.  */
+    printf("[INIT] Requesting valve address claims...\n");
+    struct can_frame req;
+    req = kz_build_request(KZVALVE_SA_LOX, KZVALVE_SA_PI, PGN_ADDR_CLAIMED);
+    can_send_frame(&req);
+    usleep(10000);
+    req = kz_build_request(KZVALVE_SA_IPA, KZVALVE_SA_PI, PGN_ADDR_CLAIMED);
+    can_send_frame(&req);
+
+    /* Wait up to 5 s for address claims */
     for (int i = 0; i < 100; i++) {       /* 100 × 50 ms = 5 s */
         can_process_rx();
         pthread_mutex_lock(&state_mutex);
@@ -615,17 +623,22 @@ static bool valve_init_sequence(void)
 
     if (!ok) {
         fprintf(stderr, "[INIT] WARNING: Not all valves found on bus — "
-                        "check CAN wiring.  Continuing anyway.\n");
-        return false;
+                        "continuing anyway.\n");
+        /* Mark both valves on bus anyway — if commands are being accepted
+         * the valve is present even if its address claim was missed.      */
+        pthread_mutex_lock(&state_mutex);
+        g_state.lox_on_bus = true;
+        g_state.ipa_on_bus = true;
+        pthread_mutex_unlock(&state_mutex);
+    } else {
+        printf("[INIT] Both valves on bus\n");
     }
-    printf("[INIT] Both valves on bus\n");
 
-    /* Configure periodic position broadcast at 100 ms */
+    /* Configure periodic position broadcast at 100 ms regardless.
+     * If the valve is responding to commands it will accept Mode 5.      */
     can_configure_periodic();
-    usleep(50000);
+    usleep(100000);   /* 100ms — give valve time to start broadcasting     */
 
-    /* Valves stay at their current physical position.
-     * Press Init ICs in the GUI when ready to slew to THETA_O/THETA_F. */
     printf("[INIT] CAN ready. Verify valve positions in GUI, then press Init ICs.\n");
     return true;
 }

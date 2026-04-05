@@ -199,6 +199,25 @@ static inline struct can_frame kz_build_absolute_pct(
     return f;
 }
 
+/* Periodic config using Prop A EID (DP=0) — must match the command mode.
+ * Same wire format as kz_build_periodic_cfg but with EID_PROP_A_BASE.     */
+static inline struct can_frame kz_build_periodic_cfg_propa(
+        uint8_t dest_sa, uint8_t src_sa, uint32_t period_ms)
+{
+    struct can_frame f = {0};
+    f.can_id  = (EID_PROP_A_BASE | ((uint32_t)dest_sa << 8) | src_sa) | CAN_EFF_FLAG;
+    f.can_dlc = 8;
+    f.data[0] = (uint8_t)(period_ms & 0xFF);
+    f.data[1] = (uint8_t)((period_ms >> 8)  & 0xFF);
+    f.data[2] = (uint8_t)((period_ms >> 16) & 0xFF);
+    f.data[3] = MODE_PERIODIC_CFG;   /* 0x05 */
+    f.data[4] = 0xFF;
+    f.data[5] = 0xFF;
+    f.data[6] = 0xFF;
+    f.data[7] = 0xFF;
+    return f;
+}
+
 /* Suppress warn_unused_result on write() for GUI socket sends.
  * Network writes to a client socket are best-effort — if the client
  * disconnected we don't care about the partial write.               */
@@ -404,11 +423,11 @@ static void can_configure_periodic(void)
 {
     struct can_frame f;
 
-    f = kz_build_periodic_cfg(KZVALVE_SA_LOX, KZVALVE_SA_PI, CAN_PERIOD_MS);
+    f = kz_build_periodic_cfg_propa(KZVALVE_SA_LOX, KZVALVE_SA_PI, CAN_PERIOD_MS);
     can_send_frame(&f);
     usleep(20000);
 
-    f = kz_build_periodic_cfg(KZVALVE_SA_IPA, KZVALVE_SA_PI, CAN_PERIOD_MS);
+    f = kz_build_periodic_cfg_propa(KZVALVE_SA_IPA, KZVALVE_SA_PI, CAN_PERIOD_MS);
     can_send_frame(&f);
     usleep(20000);
 
@@ -476,11 +495,11 @@ static void can_process_rx(void)
          * This prevents misinterpreting other CAN traffic as position feedback.
          * DLC must be 8 and the frame must not be an error frame.          */
         bool is_known_valve = (sa == KZVALVE_SA_LOX || sa == KZVALVE_SA_IPA);
-        /* Prop A feedback uses DP=0 → PGN 0x00EF00.
-         * data[2] carries actual position as percent (0-100); convert to deg. */
+        /* In Prop A mode the valve sends feedback as Prop A (DP=0, PGN 0x00EF00).
+         * data[2] is actual position as percent (0-100); convert to degrees. */
         if ((pgn & 0x1FF00u) == 0x0EF00u && is_known_valve && f.can_dlc == 8) {
             uint8_t fmi = 0;
-            uint8_t pos_pct = kz_parse_position(&f, &fmi);   /* 0-100 % */
+            uint8_t pos_pct = kz_parse_position(&f, &fmi);       /* 0-100 % */
             uint8_t pos_deg = (uint8_t)round(pos_pct * 90.0 / 100.0);
 
             pthread_mutex_lock(&state_mutex);

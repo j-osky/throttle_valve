@@ -596,11 +596,27 @@ static void gui_init(void)
     printf("[GUI] HTTP server on port %d\n", GUI_PORT);
 }
 
+/* Replace NaN/Inf with 0.0 so snprintf never emits "nan"/"inf" into JSON.
+ * JSON spec does not allow these literals — the browser's JSON.parse() will
+ * throw a SyntaxError and the GUI will show "No Connection".              */
+static inline double jsafe(double v) { return (isfinite(v) ? v : 0.0); }
+
 static void gui_build_status_json(char *buf, size_t sz)
 {
     pthread_mutex_lock(&state_mutex);
     SharedState s = g_state;
     pthread_mutex_unlock(&state_mutex);
+
+    /* Sanitize all doubles before formatting */
+    s.lox_cmd_deg    = jsafe(s.lox_cmd_deg);
+    s.ipa_cmd_deg    = jsafe(s.ipa_cmd_deg);
+    s.mr_est         = jsafe(s.mr_est);
+    s.thrust_est_lbf = jsafe(s.thrust_est_lbf);
+    s.pom_psi        = jsafe(s.pom_psi);
+    s.pfm_psi        = jsafe(s.pfm_psi);
+    s.pc_psi         = jsafe(s.pc_psi);
+    s.pom_set_psi    = jsafe(s.pom_set_psi);
+    s.loop_dt_ms     = jsafe(s.loop_dt_ms);
 
     snprintf(buf, sz,
         "{"

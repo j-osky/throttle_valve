@@ -329,6 +329,13 @@ typedef struct {
 static SensorCache       g_sensors  = {322.8241, 370.7493, 370.8182};
 static pthread_mutex_t   sensor_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* ── Valve angle cache — written by can_process_rx(), read by daq_push_thread ──
+ * Feeds actual valve positions (from real CAN feedback) into mock_daq so the
+ * mock physics reflects what the real valves are doing.                     */
+typedef struct { double lox_deg; double ipa_deg; } ValveAngles;
+static ValveAngles     g_valve_angles = {0.0, 0.0};
+static pthread_mutex_t valve_angle_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* ══════════════════════════════════════════════════════════════════════════
  * Shared state (protected by state_mutex)
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -544,6 +551,13 @@ static void can_process_rx(void)
                 g_state.ipa_fmi        = fmi;
                 g_state.ipa_on_bus     = true;
             }
+            /* Update valve angle cache for daq_push_thread */
+            pthread_mutex_lock(&valve_angle_mutex);
+            if (sa == KZVALVE_SA_LOX)
+                g_valve_angles.lox_deg = pos_deg;
+            else if (sa == KZVALVE_SA_IPA)
+                g_valve_angles.ipa_deg = pos_deg;
+            pthread_mutex_unlock(&valve_angle_mutex);
 
             /* Fault detection — only on confirmed bad FMI codes, only when
              * RUNNING. FMI=0 is normal. FMI values 1,2,5,6,8-12 are not used
@@ -681,6 +695,65 @@ static void *sensor_thread(void *arg)
     curl_easy_cleanup(c_pom);
     curl_easy_cleanup(c_pfm);
     curl_easy_cleanup(c_pc);
+    return NULL;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * DAQ push thread — sends actual valve positions to mock_daq at 10 Hz
+ *
+ * When real valves are connected (no mock_can_bridge), mock_daq has no way
+ * to know actual valve positions unless tv_main tells it.  This thread reads
+ * g_valve_angles (written by can_process_rx from real CAN feedback) and
+ * POSTs to mock_daq /mock/valve_angles at 10 Hz so the mock physics reflects
+ * what the real valves are doing and PT readings respond accordingly.
+ *
+ * If mock_daq is not running the POST fails silently — no impact on control.
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void *daq_push_thread(void *arg)
+{
+    (void)arg;
+    CURL *curl = curl_easy_init();
+    if (!curl) return NULL;
+
+    curl_easy_setopt(curl, CURLOPT_URL,        DAQSTRA_BASE "/mock/valve_angles");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 80L);    /* 80ms — non-blocking enough */
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,   1L);
+    curl_easy_setopt(curl, CURLOPT_POST,       1L);
+
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    const long PUSH_PERIOD_NS = (1000000000L / 10);   /* 100ms = 10 Hz */
+
+    while (g_running) {
+        pthread_mutex_lock(&valve_angle_mutex);
+        double lox = g_valve_angles.lox_deg;
+        double ipa = g_valve_angles.ipa_deg;
+        pthread_mutex_unlock(&valve_angle_mutex);
+
+        /* Build JSON body */
+        char body[128];
+        snprintf(body, sizeof(body),
+                 "{\"lox_deg\":%.4f,\"ipa_deg\":%.4f}", lox, ipa);
+        curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, body);
+
+        /* Set Content-Type header */
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        curl_easy_perform(curl);   /* fire-and-forget; ignore errors */
+        curl_slist_free_all(headers);
+
+        /* Sleep until next 10 Hz tick */
+        next.tv_nsec += PUSH_PERIOD_NS;
+        if (next.tv_nsec >= 1000000000L) {
+            next.tv_nsec -= 1000000000L;
+            next.tv_sec++;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+    }
+
+    curl_easy_cleanup(curl);
     return NULL;
 }
 
@@ -1053,6 +1126,14 @@ int main(void)
         fprintf(stderr, "[DAQ] Failed to create sensor thread\n"); return 1;
     }
     pthread_detach(sensor_tid);
+
+    /* Spawn DAQ push thread — feeds actual valve positions to mock_daq */
+    pthread_t daq_push_tid;
+    if (pthread_create(&daq_push_tid, NULL, daq_push_thread, NULL) != 0) {
+        fprintf(stderr, "[DAQ] Failed to create daq_push_thread\n"); return 1;
+    }
+    pthread_detach(daq_push_tid);
+
     /* Give the sensor thread time to populate the cache before the
      * control loop starts — one full read cycle takes ~3 × 5ms = 15ms.   */
     usleep(100000);   /* 100 ms — guarantees at least one full cache fill   */

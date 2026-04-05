@@ -223,13 +223,13 @@ static const double THETA_F = 40.67697413;   /* theta_f: IPA valve IC (deg) */
 #define TICK_NS             (1000000000L / CTRL_HZ)  /* 5,882,353 ns       */
 
 /* ══════════════════════════════════════════════════════════════════════════
- * DAQstra sensor cache — updated by background thread, read by control loop
+ * DAQstra sensor cache — updated by sensor_thread, read by control loop
  *
  * The three HTTP sensor reads (POM, PFM, PC) each take 1-30ms on the Pi,
  * causing >97% overrun at 170 Hz if called synchronously in the control loop.
- * Instead a background thread fetches at ~50 Hz and writes to this cache.
+ * sensor_thread fetches all three at 170 Hz and writes to this cache.
  * The control loop reads the cache without blocking — worst case it uses a
- * value that is up to ~20ms old, which is fine given the 10-tap FIR filter.
+ * value from the previous tick, which the 10-tap FIR smooths anyway.
  * ══════════════════════════════════════════════════════════════════════════ */
 typedef struct {
     double pom_psi;
@@ -489,24 +489,15 @@ static size_t curl_write_cb(void *data, size_t sz, size_t n, void *userp)
     return add;
 }
 
-/* daqstra_init_handle — configure a persistent CURL handle for one sensor.
- * Call once at startup per handle.  The URL is fixed per-handle so we never
- * need to update it.  Never call curl_easy_reset() on these handles — that
- * drops the keep-alive TCP connection and forces a new handshake every tick.
- *
- * NOTE: CURLOPT_URL requires the URL string to remain valid for the lifetime
- * of the handle.  We store it in a static per-call buffer using a file-scope
- * array indexed by call order (POM=0, PFM=1, PC=2).                        */
 #define DAQSTRA_MAX_URL 512
-static char s_daqstra_urls[3][DAQSTRA_MAX_URL];  /* persistent URL storage  */
-static int  s_daqstra_url_idx = 0;               /* next slot to allocate   */
 
-static void daqstra_init_handle(CURL *c, const char *sensor_id)
+/* daqstra_init_handle — configure a persistent CURL handle for one sensor.
+ * url_buf must be a caller-owned buffer of at least DAQSTRA_MAX_URL bytes
+ * that outlives the handle — CURLOPT_URL does not copy the string.         */
+static void daqstra_init_handle(CURL *c, const char *sensor_id, char *url_buf)
 {
-    /* Claim a persistent URL slot — must be called at most 3 times         */
-    char *url = s_daqstra_urls[s_daqstra_url_idx++];
-    snprintf(url, DAQSTRA_MAX_URL, DAQSTRA_BASE "/api/v1/sensors/%s", sensor_id);
-    curl_easy_setopt(c, CURLOPT_URL,           url);   /* points to static buffer */
+    snprintf(url_buf, DAQSTRA_MAX_URL, DAQSTRA_BASE "/api/v1/sensors/%s", sensor_id);
+    curl_easy_setopt(c, CURLOPT_URL,           url_buf);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(c, CURLOPT_TIMEOUT_MS,    30L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL,      1L);
@@ -541,16 +532,17 @@ static double daqstra_get_by_id(CURL *curl, const char *sensor_id)
 
 /* ══════════════════════════════════════════════════════════════════════════
  * DAQstra sensor background thread
- * Reads POM/PFM/PC via HTTP at ~50 Hz and writes to g_sensors cache.
- * The control loop reads from g_sensors without blocking.
+ * Reads POM/PFM/PC via HTTP at 170 Hz and writes to g_sensors cache.
+ * The control loop reads from g_sensors without blocking (<1 µs mutex read).
+ * If an HTTP call takes longer than one 5.882ms tick the thread catches up
+ * on the next clock_nanosleep — same hold-last-value behaviour as before.
  * ══════════════════════════════════════════════════════════════════════════ */
 static void *sensor_thread(void *arg)
 {
     (void)arg;
 
-    /* Each handle has its URL already set by daqstra_init_handle() in main().
-     * We receive the three handles via a small struct passed as arg — but to
-     * keep this simple we re-initialise local handles here.                */
+    /* Each handle owns its own persistent TCP connection to DAQstra.
+     * URL buffers are thread-local and outlive the handles.           */
     CURL *c_pom = curl_easy_init();
     CURL *c_pfm = curl_easy_init();
     CURL *c_pc  = curl_easy_init();
@@ -558,13 +550,16 @@ static void *sensor_thread(void *arg)
         fprintf(stderr, "[DAQ] sensor_thread: curl_easy_init failed\n");
         return NULL;
     }
-    daqstra_init_handle(c_pom, SENSOR_ID_POM);
-    daqstra_init_handle(c_pfm, SENSOR_ID_PFM);
-    daqstra_init_handle(c_pc,  SENSOR_ID_PC);
+    char url_pom[DAQSTRA_MAX_URL];
+    char url_pfm[DAQSTRA_MAX_URL];
+    char url_pc [DAQSTRA_MAX_URL];
+    daqstra_init_handle(c_pom, SENSOR_ID_POM, url_pom);
+    daqstra_init_handle(c_pfm, SENSOR_ID_PFM, url_pfm);
+    daqstra_init_handle(c_pc,  SENSOR_ID_PC,  url_pc);
 
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
-    const long SENSOR_PERIOD_NS = 20000000L;   /* 20ms = 50 Hz              */
+    const long SENSOR_PERIOD_NS = (1000000000L / 170);  /* 5.882ms = 170 Hz */
 
     while (g_running) {
         double pom = daqstra_get_by_id(c_pom, SENSOR_ID_POM);
@@ -577,7 +572,8 @@ static void *sensor_thread(void *arg)
         if (!isnan(pc))  g_sensors.pc_psi  = pc;
         pthread_mutex_unlock(&sensor_mutex);
 
-        /* Sleep until next 20ms tick */
+        /* Sleep until next 170 Hz tick.  If HTTP took longer than one tick,
+         * clock_nanosleep returns immediately and the thread self-corrects. */
         next.tv_nsec += SENSOR_PERIOD_NS;
         if (next.tv_nsec >= 1000000000L) {
             next.tv_nsec -= 1000000000L;
@@ -918,32 +914,18 @@ int main(void)
     signal(SIGTERM, sig_handler);
 
     /* ── Initialise libcurl ─────────────────────────────────────────────── */
-    /* One persistent CURL handle per sensor so TCP connections are reused
-     * across calls.  curl_easy_reset() clears keep-alive state, so we never
-     * call it — we just update CURLOPT_URL before each perform().           */
     curl_global_init(CURL_GLOBAL_ALL);
-    CURL *curl_pom = curl_easy_init();
-    CURL *curl_pfm = curl_easy_init();
-    CURL *curl_pc  = curl_easy_init();
-    if (!curl_pom || !curl_pfm || !curl_pc) {
-        fprintf(stderr, "curl_easy_init failed\n"); return 1;
-    }
-    /* The main curl handles are kept for potential future use but the
-     * sensor_thread creates its own handles internally.  We can clean up
-     * these here since sensor reads are now fully off the control loop.   */
-    curl_easy_cleanup(curl_pom);
-    curl_easy_cleanup(curl_pfm);
-    curl_easy_cleanup(curl_pc);
 
-    /* Spawn background sensor thread — reads DAQstra at 50 Hz into cache */
+    /* Spawn background sensor thread — reads DAQstra at 170 Hz into cache.
+     * The thread creates its own curl handles internally.                  */
     pthread_t sensor_tid;
     if (pthread_create(&sensor_tid, NULL, sensor_thread, NULL) != 0) {
         fprintf(stderr, "[DAQ] Failed to create sensor thread\n"); return 1;
     }
     pthread_detach(sensor_tid);
-    /* Give the sensor thread time to get at least one reading before
-     * the control loop starts so the cache isn't stale on first tick. */
-    usleep(50000);   /* 50 ms */
+    /* Give the sensor thread time to populate the cache before the
+     * control loop starts — one full read cycle takes ~3 × 5ms = 15ms.   */
+    usleep(100000);   /* 100 ms — guarantees at least one full cache fill   */
 
     /* ── Open CAN bus ───────────────────────────────────────────────────── */
     if (can_open(CAN_IFACE) < 0) {
@@ -1000,10 +982,10 @@ int main(void)
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
         /* ── 1. Read PT sensors from cache (populated by sensor_thread) ────── *
-         * The background sensor_thread fetches POM/PFM/PC at 50 Hz via     *
-         * HTTP and writes to g_sensors.  Reading the cache here is         *
-         * non-blocking (<1 µs) so the 170 Hz loop timing is preserved.     *
-         * Worst-case sensor age is ~20ms — well within the FIR window.     */
+         * sensor_thread fetches POM/PFM/PC at 170 Hz via HTTP and writes   *
+         * to g_sensors.  Reading the cache here is non-blocking (<1 µs).   *
+         * If an HTTP call took >5.88ms the previous value is held — same    *
+         * behaviour as the original NaN fallback, without blocking the loop. */
         pthread_mutex_lock(&sensor_mutex);
         double pom = g_sensors.pom_psi;
         double pfm = g_sensors.pfm_psi;

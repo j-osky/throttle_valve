@@ -780,6 +780,11 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
     if (strncmp(req, "POST /api/cmd/run", 17) == 0) {
         pthread_mutex_lock(&state_mutex);
         if (g_state.state == SYS_ARMED) {
+            /* Reinitialise Simulink model before every firing.
+             * This resets PI integrators and FIR buffers to their IC values
+             * so windup from a previous run or thrust setpoint change does
+             * not carry into the new firing sequence.                      */
+            tv_controller_2_1_initialize();
             g_state.control_enabled = true;
             g_state.state = SYS_RUNNING;
         }
@@ -796,6 +801,10 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
             g_state.state = SYS_READY;
         pthread_mutex_unlock(&state_mutex);
         can_drive_safe();
+        /* Reset Simulink integrators to ICs so the next FIRE starts clean.
+         * Without this, wound-up integrators from this run would immediately
+         * drive valves to saturation on the next firing.                   */
+        tv_controller_2_1_initialize();
         GUI_WRITE(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 41);
         return;
     }

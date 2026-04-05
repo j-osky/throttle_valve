@@ -525,10 +525,13 @@ static void can_process_rx(void)
          * DLC must be 8 and the frame must not be an error frame.          */
         bool is_known_valve = (sa == KZVALVE_SA_LOX || sa == KZVALVE_SA_IPA);
         /* In Prop A mode the valve sends feedback as Prop A (DP=0, PGN 0x00EF00).
-         * data[2] is actual position as percent (0-100); convert to degrees. */
+         * data[2] is actual position as percent (0-100); convert to degrees.
+         * data[5] upper bits carry status flags — mask to lower 5 bits for
+         * the standard J1939 FMI value (FMI is defined as 5-bit, 0-31).   */
         if ((pgn & 0x1FF00u) == 0x0EF00u && is_known_valve && f.can_dlc == 8) {
-            uint8_t fmi = 0;
-            uint8_t pos_pct = kz_parse_position(&f, &fmi);       /* 0-100 % */
+            uint8_t fmi_raw = 0;
+            uint8_t pos_pct = kz_parse_position(&f, &fmi_raw);
+            uint8_t fmi     = fmi_raw & 0x1Fu;   /* mask to 5-bit FMI field */
             uint8_t pos_deg = (uint8_t)round(pos_pct * 90.0 / 100.0);
 
             pthread_mutex_lock(&state_mutex);
@@ -885,6 +888,11 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
     if (strncmp(req, "POST /api/cmd/run", 17) == 0) {
         pthread_mutex_lock(&state_mutex);
         if (g_state.state == SYS_ARMED) {
+            /* Reinitialise Simulink model before every firing.
+             * This resets PI integrators and FIR buffers to their IC values
+             * so windup from a previous run or thrust setpoint change does
+             * not carry into the new firing sequence.                      */
+            tv_controller_2_1_initialize();
             g_state.control_enabled = true;
             g_state.state = SYS_RUNNING;
         }
@@ -901,6 +909,10 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
             g_state.state = SYS_READY;
         pthread_mutex_unlock(&state_mutex);
         can_drive_safe();
+        /* Reset Simulink integrators to ICs so the next FIRE starts clean.
+         * Without this, wound-up integrators from this run would immediately
+         * drive valves to saturation on the next firing.                   */
+        tv_controller_2_1_initialize();
         GUI_WRITE(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 41);
         return;
     }

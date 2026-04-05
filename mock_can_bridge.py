@@ -371,8 +371,14 @@ class MockCANBridge:
                 continue   # Not a command we care about — ignore
 
             da, sa = result    # Destination address, source address
-            deg = float(msg.data[0])   # Byte 1: commanded position in degrees
-            # msg.data[1] = speed (we ignore — slew rate is fixed at SLEW_RATE)
+
+            # Byte 1 (data[0]) meaning depends on DP bit in the EID:
+            #   DP=1 (Prop A2, 0x19EF...): value is degrees  (0-90)
+            #   DP=0 (Prop A,  0x18EF...): value is percent  (0-100) → convert to degrees
+            eid     = msg.arbitration_id
+            dp_bit  = (eid >> 24) & 0x1
+            raw_val = float(msg.data[0])
+            deg     = raw_val if dp_bit == 1 else raw_val * 90.0 / 100.0
 
             # Apply a 0.5 deg deadband: only update cmd if the new value differs
             # by more than 0.5 deg from current.  This prevents 1-count integer

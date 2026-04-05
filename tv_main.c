@@ -360,11 +360,13 @@ static void can_configure_periodic(void)
 /* ── Send absolute degree command to both valves ─────────────────────────── */
 static void can_send_valve_commands(double lox_deg, double ipa_deg)
 {
-    /* Clamp and convert to uint8 */
+    /* Clamp, round, and convert to uint8.
+     * Round (not truncate) so the integer command is the nearest degree,
+     * minimising the DC bias that causes the PI to dither ±1 count. */
     uint8_t lox = (uint8_t)fmax(VALVE_MIN_DEG,
-                                  fmin(VALVE_MAX_DEG, lox_deg));
+                                  fmin(VALVE_MAX_DEG, round(lox_deg)));
     uint8_t ipa = (uint8_t)fmax(VALVE_MIN_DEG,
-                                  fmin(VALVE_MAX_DEG, ipa_deg));
+                                  fmin(VALVE_MAX_DEG, round(ipa_deg)));
 
     struct can_frame f;
 

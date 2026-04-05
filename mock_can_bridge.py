@@ -193,12 +193,13 @@ class MockCANBridge:
         self.daq_url = daq_url.rstrip("/")
         self.bus     = None
 
-        # Start both valves at the Simulink 500 lbf initial conditions
-        # (matching THETA_O and THETA_F in tv_main.c)
-        self.lox_actual = 41.06
-        self.ipa_actual = 40.68
-        self.lox_cmd    = 41.06
-        self.ipa_cmd    = 40.68
+        # Start valves at 0 deg (closed/unknown).
+        # The operator must press Init ICs in the GUI before firing —
+        # this ensures actual positions reflect reality, not an assumed IC.
+        self.lox_actual = 0.0
+        self.ipa_actual = 0.0
+        self.lox_cmd    = 0.0
+        self.ipa_cmd    = 0.0
 
         self.last_t = time.monotonic()
 
@@ -338,14 +339,20 @@ class MockCANBridge:
                 continue   # Not a command we care about — ignore
 
             da, sa = result    # Destination address, source address
-            deg    = msg.data[0]   # Byte 1: commanded position in degrees
+            deg = float(msg.data[0])   # Byte 1: commanded position in degrees
             # msg.data[1] = speed (we ignore — slew rate is fixed at SLEW_RATE)
 
-            # Update the commanded angle for the appropriate valve
+            # Apply a 0.5 deg deadband: only update cmd if the new value differs
+            # by more than 0.5 deg from current.  This prevents 1-count integer
+            # dithering from the uint8 quantization in can_send_valve_commands()
+            # from continuously slewing the simulated valve back and forth.
+            DEADBAND = 0.5
             if da == SA_LOX:
-                self.lox_cmd = float(deg)
+                if abs(deg - self.lox_cmd) > DEADBAND:
+                    self.lox_cmd = deg
             elif da == SA_IPA:
-                self.ipa_cmd = float(deg)
+                if abs(deg - self.ipa_cmd) > DEADBAND:
+                    self.ipa_cmd = deg
             # Ignore commands addressed to other devices
 
 

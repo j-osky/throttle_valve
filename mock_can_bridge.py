@@ -314,13 +314,45 @@ class MockCANBridge:
         time.sleep(0.3)   # Give tv_main time to send its own address claim first
         self.send_address_claims()
 
-        # Background thread: feedback and physics update at 10 Hz (100ms period)
+        # Physics update loop at 170 Hz — matches Simulink plant update rate.
+        # Slewing at 170 Hz means the DAQ sees a smooth pressure ramp as the
+        # valve moves, identical to how the Simulink 2_0 plant behaved.
+        # Without this, the DAQ holds pressure constant for 100ms then steps,
+        # which causes the FIR-filtered MR signal to lag and the IPA integrator
+        # to wind up, producing oscillation that doesn't exist in Simulink.
+        PHYSICS_HZ  = 170
+        PHYSICS_DT  = 1.0 / PHYSICS_HZ          # 5.88 ms
+        CAN_DIVIDER = PHYSICS_HZ // 10           # Send CAN feedback every 17 ticks = 10 Hz
+        SLEW_STEP   = self.SLEW_RATE_DEG_PER_SEC * PHYSICS_DT  # 0.353 deg/tick
+
         def feedback_loop():
+            tick = 0
             while True:
-                self.slew_valves()    # Advance valve positions at 60 deg/s
-                self.push_to_daq()   # Update mock_daq.py physics
-                self.send_feedback() # Send Prop A2 feedback to tv_main on CAN
-                time.sleep(0.1)      # 100ms = 10 Hz
+                t0 = time.monotonic()
+
+                # Slew valves one physics step toward commanded angle
+                def step_valve(actual, cmd):
+                    diff = cmd - actual
+                    if abs(diff) <= SLEW_STEP:
+                        return cmd
+                    return actual + math.copysign(SLEW_STEP, diff)
+
+                self.lox_actual = step_valve(self.lox_actual, self.lox_cmd)
+                self.ipa_actual = step_valve(self.ipa_actual, self.ipa_cmd)
+
+                # Update DAQ physics every tick at 170 Hz
+                self.push_to_daq()
+
+                # Send CAN feedback at 10 Hz (every 17 ticks)
+                tick += 1
+                if tick >= CAN_DIVIDER:
+                    tick = 0
+                    self.send_feedback()
+
+                # Sleep for remainder of 5.88ms tick
+                elapsed = time.monotonic() - t0
+                sleep_t = max(0.0, PHYSICS_DT - elapsed)
+                time.sleep(sleep_t)
 
         threading.Thread(target=feedback_loop, daemon=True).start()
 

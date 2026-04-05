@@ -218,6 +218,35 @@ static inline struct can_frame kz_build_periodic_cfg_propa(
     return f;
 }
 
+/* kz_build_request_propa — Request PGN frame per KZValve Prop A spec.
+ *
+ * Per KZValve documentation, the request frame must use DLC=8 with the
+ * requested PGN in bytes 0-2 and trailing zeros (not the J1939 standard
+ * DLC=3 format).  Requesting PGN 0x00EF00 asks for Prop A position feedback.
+ *
+ * Wire format confirmed by KZValve:
+ *   EID:    0x18EABE01 (Pi→LOX) / 0x18EABF01 (Pi→IPA)
+ *   data:   00 EF 00 00 00 00 00 00
+ *           ↑──────┘ PGN 0x00EF00 (Prop A), bytes 4-8 = 0x00
+ */
+static inline struct can_frame kz_build_request_propa(
+        uint8_t dest_sa, uint8_t src_sa)
+{
+    struct can_frame f = {0};
+    /* EID_REQUEST_BASE = 0x18EA0000, DP=0, PF=0xEA */
+    f.can_id  = (0x18EA0000u | ((uint32_t)dest_sa << 8) | src_sa) | CAN_EFF_FLAG;
+    f.can_dlc = 8;                   /* KZValve requires DLC=8, not J1939 DLC=3 */
+    f.data[0] = 0x00;                /* PGN 0x00EF00 LSB */
+    f.data[1] = 0xEF;                /* PGN 0x00EF00 MID */
+    f.data[2] = 0x00;                /* PGN 0x00EF00 MSB */
+    f.data[3] = 0x00;                /* trailing zero */
+    f.data[4] = 0x00;
+    f.data[5] = 0x00;
+    f.data[6] = 0x00;
+    f.data[7] = 0x00;
+    return f;
+}
+
 /* Suppress warn_unused_result on write() for GUI socket sends.
  * Network writes to a client socket are best-effort — if the client
  * disconnected we don't care about the partial write.               */
@@ -701,7 +730,19 @@ static bool valve_init_sequence(void)
     /* Configure periodic position broadcast at 100 ms regardless.
      * If the valve is responding to commands it will accept Mode 5.      */
     can_configure_periodic();
-    usleep(100000);   /* 100ms — give valve time to start broadcasting     */
+    usleep(100000);   /* 100ms — give valve time to process Mode 5         */
+
+    /* Send explicit position requests immediately after Mode 5.
+     * Per KZValve spec: Request PGN 0x00EF00 with DLC=8.
+     * This confirms the valve is alive and triggers the first feedback.  */
+    struct can_frame rq;
+    rq = kz_build_request_propa(KZVALVE_SA_LOX, KZVALVE_SA_PI);
+    can_send_frame(&rq);
+    usleep(10000);
+    rq = kz_build_request_propa(KZVALVE_SA_IPA, KZVALVE_SA_PI);
+    can_send_frame(&rq);
+    usleep(50000);
+    can_process_rx();   /* read any immediate response */
 
     printf("[INIT] CAN ready. Verify valve positions in GUI, then press Init ICs.\n");
     return true;
@@ -1125,6 +1166,20 @@ int main(void)
                 pthread_mutex_lock(&state_mutex);
                 g_state.can_send_count++;
                 pthread_mutex_unlock(&state_mutex);
+            }
+
+            /* Poll for position every 5 CAN ticks (500ms) as a fallback.
+             * If the valve missed the periodic config or periodic feedback
+             * stops for any reason, this guarantees we still get position.
+             * Request PGN 0x00EF00 per KZValve Prop A spec (DLC=8).      */
+            static int poll_tick = 0;
+            if (++poll_tick >= 5) {
+                poll_tick = 0;
+                struct can_frame rq;
+                rq = kz_build_request_propa(KZVALVE_SA_LOX, KZVALVE_SA_PI);
+                can_send_frame(&rq);
+                rq = kz_build_request_propa(KZVALVE_SA_IPA, KZVALVE_SA_PI);
+                can_send_frame(&rq);
             }
         }
 

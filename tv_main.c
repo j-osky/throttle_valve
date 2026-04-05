@@ -840,11 +840,41 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
     if (strncmp(req, "POST /api/cmd/run", 17) == 0) {
         pthread_mutex_lock(&state_mutex);
         if (g_state.state == SYS_ARMED) {
-            /* Reinitialise Simulink model before every firing.
-             * This resets PI integrators and FIR buffers to their IC values
-             * so windup from a previous run or thrust setpoint change does
-             * not carry into the new firing sequence.                      */
+            /* Guard: block FIRE if either valve is more than 5 deg from IC.
+             * If valves are not at ICs the integrators will immediately wind —
+             * the operator must press Init ICs and wait for valves to settle. */
+            double lox_err = fabs((double)g_state.lox_actual_deg - THETA_O);
+            double ipa_err = fabs((double)g_state.ipa_actual_deg - THETA_F);
+            if (lox_err > 5.0 || ipa_err > 5.0) {
+                fprintf(stderr,
+                    "[FIRE BLOCKED] Valves not at ICs: "
+                    "LOX actual=%.1f° (target=%.1f°, err=%.1f°) "
+                    "IPA actual=%.1f° (target=%.1f°, err=%.1f°)\n",
+                    (double)g_state.lox_actual_deg, THETA_O, lox_err,
+                    (double)g_state.ipa_actual_deg, THETA_F, ipa_err);
+                pthread_mutex_unlock(&state_mutex);
+                GUI_WRITE(fd,
+                    "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
+                    "BLOCKED: Valves not at ICs — press Init ICs and wait", 79);
+                return;
+            }
+            /* Reinitialise Simulink model before every firing. */
             tv_controller_2_1_initialize();
+
+            /* Pre-fill FIR filter buffers with current sensor readings.
+             * initialize() zeros all buffers — without this, the first 10
+             * ticks average zero + real readings, causing MR to spike and
+             * the IPA integrator to wind to saturation before the FIR
+             * converges (~58ms).  Pre-filling eliminates this transient.  */
+            double pom_ic = g_state.pom_psi;
+            double pfm_ic = g_state.pfm_psi;
+            double pc_ic  = g_state.pc_psi;
+            for (int i = 0; i < 9; i++) {
+                tv_controller_2_1_DW.DiscreteFIRFilter1_states[i] = pom_ic;
+                tv_controller_2_1_DW.DiscreteFIRFilter2_states[i] = pc_ic;
+                tv_controller_2_1_DW.DiscreteFIRFilter_states[i]  = pfm_ic;
+            }
+
             g_state.control_enabled = true;
             g_state.state = SYS_RUNNING;
         }

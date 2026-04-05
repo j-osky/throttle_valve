@@ -140,7 +140,7 @@ main{max-width:1040px;margin:0 auto;padding:24px 20px 48px;
 .pt-gauge-desc{font-size:10px;color:var(--text-tertiary);margin-top:2px}
 
 /* ── Engine ──────────────────────────────────────────────────────────── */
-.metric-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px}
+.metric-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:4px}
 .metric-tile{background:var(--surface2);border:1px solid var(--border);
               border-radius:var(--radius-sm);padding:12px 14px}
 .metric-val{font-size:22px;font-weight:400;color:var(--text-primary);
@@ -455,6 +455,14 @@ footer span{font-weight:500;color:var(--text-secondary)}
       <div class="metric-tile">
         <div class="metric-val">1.200</div>
         <div class="metric-label">MR setpoint</div>
+      </div>
+      <div class="metric-tile">
+        <div class="metric-val" id="lox_mdot">—</div>
+        <div class="metric-label">LOX ṁ (kg/s)</div>
+      </div>
+      <div class="metric-tile">
+        <div class="metric-val" id="ipa_mdot">—</div>
+        <div class="metric-label">IPA ṁ (kg/s)</div>
       </div>
     </div>
   </div>
@@ -782,6 +790,8 @@ async function poll() {
     set('thr_set', d.thrust_lbf_set.toFixed(0) + ' lbf');
     set('thr_est', d.thrust_est_lbf.toFixed(1) + ' lbf');
     set('mr',      d.mr_est.toFixed(3));
+    if (d.lox_mdot_kgs !== undefined) set('lox_mdot', d.lox_mdot_kgs.toFixed(4));
+    if (d.ipa_mdot_kgs !== undefined) set('ipa_mdot', d.ipa_mdot_kgs.toFixed(4));
 
     /* Sync active thrust on first poll */
     if (activeThrust === null) {

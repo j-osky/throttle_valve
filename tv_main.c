@@ -596,8 +596,24 @@ static void *sensor_thread(void *arg)
     return NULL;
 }
 
+/* Valve slew rate matching the KZValve EH22 at 100% speed (~60 deg/s per
+ * kzvalve_can.h: "100 = fastest ~60 deg/s").  1.5s for full 90 deg stroke. */
+#define DAQ_SLEW_DEG_PER_S  60.0
+
 /* ══════════════════════════════════════════════════════════════════════════
- * DAQ push thread — sends actual valve positions to mock_daq at 10 Hz
+ * DAQ push thread — feeds mock_daq with smoothly-slewing simulated angles
+ *
+ * WHY SMOOTH SLEW AND NOT ACTUAL CAN POSITIONS:
+ * mock_daq computes pressure instantaneously from the angle it receives.
+ * Posting actual CAN positions (10 Hz) causes pressure to step by ~34 psi
+ * every 100ms — a large discrete jump that the PI integrators treat as a
+ * sudden error, causing overshoot and oscillation.
+ *
+ * Instead this thread maintains its own simulated valve angles that slew
+ * toward the commanded target at 60 deg/s (matching the real EH22), giving
+ * mock_daq a smooth continuous ramp — exactly what the Simulink plant model
+ * received during gain tuning.  Real CAN actual positions are used only for
+ * GUI display (g_state.lox_actual_deg), not for the physics simulation.
  * ══════════════════════════════════════════════════════════════════════════ */
 static void *daq_push_thread(void *arg)
 {
@@ -606,33 +622,71 @@ static void *daq_push_thread(void *arg)
     if (!curl) return NULL;
 
     curl_easy_setopt(curl, CURLOPT_URL,        DAQSTRA_BASE "/mock/valve_angles");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 50L);    /* 50ms timeout for 10 Hz push */
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5L);     /* tight timeout — 170 Hz loop */
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,   1L);
     curl_easy_setopt(curl, CURLOPT_POST,       1L);
 
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    /* Run at 170 Hz — same rate as Simulink plant, gives mock_daq smooth input */
+    const long PUSH_PERIOD_NS = (1000000000L / 170);
+    const double DT       = 1.0 / 170.0;
+    const double MAX_STEP = DAQ_SLEW_DEG_PER_S * DT;   /* 0.353 deg/tick */
+
+    /* Simulated angles start at ICs */
+    double sim_lox = THETA_O;
+    double sim_ipa = THETA_F;
+
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
-    const long PUSH_PERIOD_NS = (1000000000L / 10);   /* 100ms = 10 Hz — commanded angles update at 170 Hz in main loop */
+
+    /* Adaptive rate: run at 170 Hz when mock_daq is responding, back off to
+     * 1 Hz when it isn't (e.g. real DAQstra test — /mock/valve_angles → 404).
+     * This prevents 170 failed HTTP calls/sec during real engine firings.    */
+    int consecutive_failures = 0;
+    const int BACKOFF_THRESHOLD = 10;
 
     while (g_running) {
+        /* Read commanded angles written by main loop step 5b */
         pthread_mutex_lock(&valve_angle_mutex);
-        double lox = g_valve_angles.lox_deg;
-        double ipa = g_valve_angles.ipa_deg;
+        double cmd_lox = g_valve_angles.lox_deg;
+        double cmd_ipa = g_valve_angles.ipa_deg;
         pthread_mutex_unlock(&valve_angle_mutex);
 
+        /* Slew simulated angles toward commanded at 60 deg/s */
+        double dl = cmd_lox - sim_lox;
+        double di = cmd_ipa - sim_ipa;
+        if (fabs(dl) <= MAX_STEP) sim_lox = cmd_lox;
+        else                      sim_lox += (dl > 0.0 ? MAX_STEP : -MAX_STEP);
+        if (fabs(di) <= MAX_STEP) sim_ipa = cmd_ipa;
+        else                      sim_ipa += (di > 0.0 ? MAX_STEP : -MAX_STEP);
+        sim_lox = fmax(0.0, fmin(90.0, sim_lox));
+        sim_ipa = fmax(0.0, fmin(90.0, sim_ipa));
+
+        /* Post smooth angle to mock_daq */
         char body[128];
         snprintf(body, sizeof(body),
-                 "{\"lox_deg\":%.4f,\"ipa_deg\":%.4f}", lox, ipa);
+                 "{\"lox_deg\":%.4f,\"ipa_deg\":%.4f}", sim_lox, sim_ipa);
         curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, body);
+        CURLcode rc = curl_easy_perform(curl);
 
-        struct curl_slist *headers = NULL;
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        if (rc == CURLE_OK) {
+            consecutive_failures = 0;
+        } else {
+            consecutive_failures++;
+        }
 
-        curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-
-        next.tv_nsec += PUSH_PERIOD_NS;
+        /* 170 Hz if mock_daq alive, 1 Hz backoff if not */
+        long period_ns;
+        if (consecutive_failures < BACKOFF_THRESHOLD) {
+            period_ns = PUSH_PERIOD_NS;
+        } else {
+            period_ns = 1000000000L;
+            clock_gettime(CLOCK_MONOTONIC, &next);
+        }
+        next.tv_nsec += period_ns;
         if (next.tv_nsec >= 1000000000L) {
             next.tv_nsec -= 1000000000L;
             next.tv_sec++;
@@ -640,6 +694,7 @@ static void *daq_push_thread(void *arg)
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
 
+    curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     return NULL;
 }
@@ -1151,14 +1206,10 @@ int main(void)
         g_state.tick_count++;
         pthread_mutex_unlock(&state_mutex);
 
-        /* ── 5b. Update valve angle cache for daq_push_thread ──────────────
-         * Post COMMANDED angles (not actual) to mock_daq.
-         * The Simulink model was tuned with pressure responding instantly
-         * to the commanded angle — the actuator transfer function was already
-         * inside the Simulink loop.  Using actual positions here would
-         * double-count the actuator lag: the TF handles it in the controller,
-         * and then the physical lag delays the pressure response again.
-         * With commanded angles, mock behaviour matches Simulink exactly.   */
+        /* ── 5b. Update commanded-angle cache for daq_push_thread ─────────
+         * The daq_push_thread slews its own simulated angles toward these
+         * commanded values at 60 deg/s (matching the real valve) and posts
+         * the smoothly-ramping simulated angles to mock_daq.               */
         pthread_mutex_lock(&valve_angle_mutex);
         g_valve_angles.lox_deg = lox_cmd;
         g_valve_angles.ipa_deg = ipa_cmd;

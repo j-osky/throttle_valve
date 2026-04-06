@@ -610,13 +610,13 @@ static void *daq_push_thread(void *arg)
     if (!curl) return NULL;
 
     curl_easy_setopt(curl, CURLOPT_URL,        DAQSTRA_BASE "/mock/valve_angles");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 80L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5L);     /* 5ms — must fit in 170 Hz tick */
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,   1L);
     curl_easy_setopt(curl, CURLOPT_POST,       1L);
 
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
-    const long PUSH_PERIOD_NS = (1000000000L / 10);
+    const long PUSH_PERIOD_NS = (1000000000L / 170);  /* 5.88ms = 170 Hz — matches controller rate */
 
     while (g_running) {
         pthread_mutex_lock(&valve_angle_mutex);

@@ -453,13 +453,9 @@ static void can_process_rx(void)
                 g_state.ipa_fmi        = fmi;
                 g_state.ipa_on_bus     = true;
             }
-            /* Update valve angle cache for daq_push_thread */
-            pthread_mutex_lock(&valve_angle_mutex);
-            if (sa == KZVALVE_SA_LOX)
-                g_valve_angles.lox_deg = (double)pos;
-            else if (sa == KZVALVE_SA_IPA)
-                g_valve_angles.ipa_deg = (double)pos;
-            pthread_mutex_unlock(&valve_angle_mutex);
+            /* Note: valve angle cache for daq_push_thread is updated from
+             * commanded angles in the main loop, not actual positions.
+             * See step 5 of the main 170 Hz loop for the update.         */
 
             /* Fault detection — only on confirmed bad FMI codes, only when
              * RUNNING. FMI=0 is normal. FMI values 1,2,5,6,8-12 are not used
@@ -610,13 +606,13 @@ static void *daq_push_thread(void *arg)
     if (!curl) return NULL;
 
     curl_easy_setopt(curl, CURLOPT_URL,        DAQSTRA_BASE "/mock/valve_angles");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5L);     /* 5ms — must fit in 170 Hz tick */
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 50L);    /* 50ms timeout for 10 Hz push */
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,   1L);
     curl_easy_setopt(curl, CURLOPT_POST,       1L);
 
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
-    const long PUSH_PERIOD_NS = (1000000000L / 170);  /* 5.88ms = 170 Hz — matches controller rate */
+    const long PUSH_PERIOD_NS = (1000000000L / 10);   /* 100ms = 10 Hz — commanded angles update at 170 Hz in main loop */
 
     while (g_running) {
         pthread_mutex_lock(&valve_angle_mutex);
@@ -1154,6 +1150,19 @@ int main(void)
         }
         g_state.tick_count++;
         pthread_mutex_unlock(&state_mutex);
+
+        /* ── 5b. Update valve angle cache for daq_push_thread ──────────────
+         * Post COMMANDED angles (not actual) to mock_daq.
+         * The Simulink model was tuned with pressure responding instantly
+         * to the commanded angle — the actuator transfer function was already
+         * inside the Simulink loop.  Using actual positions here would
+         * double-count the actuator lag: the TF handles it in the controller,
+         * and then the physical lag delays the pressure response again.
+         * With commanded angles, mock behaviour matches Simulink exactly.   */
+        pthread_mutex_lock(&valve_angle_mutex);
+        g_valve_angles.lox_deg = lox_cmd;
+        g_valve_angles.ipa_deg = ipa_cmd;
+        pthread_mutex_unlock(&valve_angle_mutex);
 
         /* ── 6. CAN: send at 10 Hz, receive every tick ──────────────────── */
         can_process_rx();

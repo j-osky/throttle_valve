@@ -307,6 +307,15 @@ typedef struct {
     uint64_t    overrun_count;
     double      loop_dt_ms;         /* actual last loop time */
     char        fault_reason[64];   /* human-readable fault cause for GUI     */
+
+    /* FMI consecutive-frame counters — fault only after sustained bad FMI.
+     * Resets to 0 when the FMI clears.  One counter per valve per FMI type. */
+    uint8_t     lox_fmi_timeout_count;   /* FMI 7  consecutive frames, LOX */
+    uint8_t     ipa_fmi_timeout_count;   /* FMI 7  consecutive frames, IPA */
+    uint8_t     lox_fmi_voltage_count;   /* FMI 4  consecutive frames, LOX */
+    uint8_t     ipa_fmi_voltage_count;   /* FMI 4  consecutive frames, IPA */
+    uint8_t     lox_fmi_cal_count;       /* FMI 13 consecutive frames, LOX */
+    uint8_t     ipa_fmi_cal_count;       /* FMI 13 consecutive frames, IPA */
 } SharedState;
 
 static SharedState   g_state;
@@ -466,27 +475,50 @@ static void can_process_rx(void)
              * commanded angles in the main loop, not actual positions.
              * See step 5 of the main 170 Hz loop for the update.         */
 
-            /* Fault detection — only on confirmed bad FMI codes, only when
-             * RUNNING. FMI=0 is normal. FMI values 1,2,5,6,8-12 are not used
-             * by KZValve so treat any unexpected nonzero as a warning only.  */
-            if (fmi == FMI_POS_TIMEOUT || fmi == FMI_NOT_CALIBRATED ||
-                fmi == FMI_UNDER_VOLTAGE) {
-                if (g_state.state == SYS_RUNNING) {
-                    g_state.state = SYS_FAULT;
-                    const char *fmi_name =
-                        fmi == FMI_POS_TIMEOUT    ? "POSITION TIMEOUT" :
-                        fmi == FMI_NOT_CALIBRATED ? "NOT CALIBRATED"   :
-                                                    "UNDER VOLTAGE";
-                    snprintf(g_state.fault_reason, sizeof(g_state.fault_reason),
-                             "%s: valve SA=0x%02X FMI=%u", fmi_name, sa, fmi);
-                    fprintf(stderr, "[FAULT] %s\n", g_state.fault_reason);
-                    fprintf(stderr, "[FAULT] At fault: LOX cmd=%.2f act=%u  IPA cmd=%.2f act=%u\n",
-                            g_state.lox_cmd_deg, g_state.lox_actual_deg,
-                            g_state.ipa_cmd_deg, g_state.ipa_actual_deg);
-                    fprintf(stderr, "[FAULT] POM=%.2f PFM=%.2f PC=%.2f thrust_set=%.1f\n",
-                            g_state.pom_psi, g_state.pfm_psi, g_state.pc_psi,
-                            g_state.thrust_lbf_set);
-                }
+            /* Fault detection with hysteresis — require N consecutive bad FMI
+             * frames before transitioning to FAULT.  A single transient FMI
+             * (e.g. during a setpoint step change) is ignored.
+             *
+             * Thresholds (at 10 Hz CAN feedback):
+             *   FMI 7  (position timeout): 5 frames = 500ms sustained
+             *   FMI 4  (under voltage):    3 frames = 300ms sustained
+             *   FMI 13 (not calibrated):   2 frames = 200ms sustained
+             *
+             * Counters reset to 0 as soon as the FMI clears.               */
+            #define FMI_THRESH_TIMEOUT  5
+            #define FMI_THRESH_VOLTAGE  3
+            #define FMI_THRESH_CAL      2
+
+            uint8_t *cnt_timeout = (sa == KZVALVE_SA_LOX) ?
+                &g_state.lox_fmi_timeout_count : &g_state.ipa_fmi_timeout_count;
+            uint8_t *cnt_voltage = (sa == KZVALVE_SA_LOX) ?
+                &g_state.lox_fmi_voltage_count : &g_state.ipa_fmi_voltage_count;
+            uint8_t *cnt_cal     = (sa == KZVALVE_SA_LOX) ?
+                &g_state.lox_fmi_cal_count     : &g_state.ipa_fmi_cal_count;
+
+            /* Increment or reset each counter based on current FMI */
+            if (fmi == FMI_POS_TIMEOUT)    (*cnt_timeout)++; else *cnt_timeout = 0;
+            if (fmi == FMI_UNDER_VOLTAGE)  (*cnt_voltage)++; else *cnt_voltage = 0;
+            if (fmi == FMI_NOT_CALIBRATED) (*cnt_cal)++;     else *cnt_cal     = 0;
+
+            /* Trigger FAULT only when threshold reached and system is RUNNING */
+            const char *fmi_name   = NULL;
+            uint8_t     fmi_thresh = 0;
+            if (*cnt_timeout >= FMI_THRESH_TIMEOUT) { fmi_name = "POSITION TIMEOUT"; fmi_thresh = FMI_POS_TIMEOUT; }
+            else if (*cnt_voltage >= FMI_THRESH_VOLTAGE) { fmi_name = "UNDER VOLTAGE";    fmi_thresh = FMI_UNDER_VOLTAGE; }
+            else if (*cnt_cal     >= FMI_THRESH_CAL)     { fmi_name = "NOT CALIBRATED";   fmi_thresh = FMI_NOT_CALIBRATED; }
+
+            if (fmi_name && g_state.state == SYS_RUNNING) {
+                g_state.state = SYS_FAULT;
+                snprintf(g_state.fault_reason, sizeof(g_state.fault_reason),
+                         "%s: valve SA=0x%02X FMI=%u", fmi_name, sa, fmi_thresh);
+                fprintf(stderr, "[FAULT] %s\n", g_state.fault_reason);
+                fprintf(stderr, "[FAULT] At fault: LOX cmd=%.2f act=%u  IPA cmd=%.2f act=%u\n",
+                        g_state.lox_cmd_deg, g_state.lox_actual_deg,
+                        g_state.ipa_cmd_deg, g_state.ipa_actual_deg);
+                fprintf(stderr, "[FAULT] POM=%.2f PFM=%.2f PC=%.2f thrust_set=%.1f\n",
+                        g_state.pom_psi, g_state.pfm_psi, g_state.pc_psi,
+                        g_state.thrust_lbf_set);
             }
             pthread_mutex_unlock(&state_mutex);
         }

@@ -221,6 +221,9 @@ static const double THETA_F = 40.67697413;   /* theta_f: IPA valve IC (deg) */
 
 /* Tick period in nanoseconds */
 #define TICK_NS             (1000000000L / CTRL_HZ)  /* 5,882,353 ns       */
+#define SENSOR_TIMEOUT_MS   500         /* Max age of sensor reading before
+                                         * FAULT is triggered during RUNNING.
+                                         * 500ms = 33× the 15ms read cycle.  */
 
 /* ══════════════════════════════════════════════════════════════════════════
  * DAQstra sensor cache — updated by sensor_thread, read by control loop
@@ -232,12 +235,14 @@ static const double THETA_F = 40.67697413;   /* theta_f: IPA valve IC (deg) */
  * value from the previous tick, which the 10-tap FIR smooths anyway.
  * ══════════════════════════════════════════════════════════════════════════ */
 typedef struct {
-    double pom_psi;
-    double pfm_psi;
-    double pc_psi;
+    double          pom_psi;
+    double          pfm_psi;
+    double          pc_psi;
+    struct timespec last_update;   /* wall-clock time of last successful read */
+    bool            ever_updated;  /* false until first real reading arrives  */
 } SensorCache;
 
-static SensorCache       g_sensors  = {322.8241, 370.7493, 370.8182};
+static SensorCache       g_sensors  = {322.8241, 370.7493, 370.8182, {0,0}, false};
 static pthread_mutex_t   sensor_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ── Valve angle cache — written by can_process_rx(), read by daq_push_thread */
@@ -298,6 +303,7 @@ typedef struct {
     uint64_t    can_send_count;
     uint64_t    overrun_count;
     double      loop_dt_ms;         /* actual last loop time */
+    char        fault_reason[64];   /* human-readable fault cause for GUI     */
 } SharedState;
 
 static SharedState   g_state;
@@ -464,7 +470,13 @@ static void can_process_rx(void)
                 fmi == FMI_UNDER_VOLTAGE) {
                 if (g_state.state == SYS_RUNNING) {
                     g_state.state = SYS_FAULT;
-                    fprintf(stderr, "[FAULT] Valve SA=0x%02X FMI=%u\n", sa, fmi);
+                    const char *fmi_name =
+                        fmi == FMI_POS_TIMEOUT    ? "POSITION TIMEOUT" :
+                        fmi == FMI_NOT_CALIBRATED ? "NOT CALIBRATED"   :
+                                                    "UNDER VOLTAGE";
+                    snprintf(g_state.fault_reason, sizeof(g_state.fault_reason),
+                             "%s: valve SA=0x%02X FMI=%u", fmi_name, sa, fmi);
+                    fprintf(stderr, "[FAULT] %s\n", g_state.fault_reason);
                 }
             }
             pthread_mutex_unlock(&state_mutex);
@@ -578,6 +590,11 @@ static void *sensor_thread(void *arg)
         if (!isnan(pom)) g_sensors.pom_psi = pom;
         if (!isnan(pfm)) g_sensors.pfm_psi = pfm;
         if (!isnan(pc))  g_sensors.pc_psi  = pc;
+        /* Stamp last_update whenever at least one sensor returned a valid value */
+        if (!isnan(pom) || !isnan(pfm) || !isnan(pc)) {
+            clock_gettime(CLOCK_MONOTONIC, &g_sensors.last_update);
+            g_sensors.ever_updated = true;
+        }
         pthread_mutex_unlock(&sensor_mutex);
 
         /* Sleep until next 170 Hz tick.  If HTTP took longer than one tick,
@@ -818,7 +835,8 @@ static void gui_build_status_json(char *buf, size_t sz)
         "\"tick_count\":%llu,\"can_send_count\":%llu,"
         "\"overrun_count\":%llu,\"loop_dt_ms\":%.3f,"
         "\"lox_on_bus\":%s,\"ipa_on_bus\":%s,"
-        "\"lox_mdot_kgs\":%.4f,\"ipa_mdot_kgs\":%.4f"
+        "\"lox_mdot_kgs\":%.4f,\"ipa_mdot_kgs\":%.4f,"
+        "\"fault_reason\":\"%s\""
         "}",
         state_names[s.state],
         s.lox_cmd_deg, s.lox_actual_deg, s.lox_fmi,
@@ -834,7 +852,8 @@ static void gui_build_status_json(char *buf, size_t sz)
         s.lox_on_bus ? "true" : "false",
         s.ipa_on_bus ? "true" : "false",
         s.lox_mdot_kgs,
-        s.ipa_mdot_kgs
+        s.ipa_mdot_kgs,
+        s.fault_reason
     );
 }
 
@@ -844,7 +863,7 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
 
     /* GET /api/status */
     if (strncmp(req, "GET /api/status", 15) == 0) {
-        char json[1024];
+        char json[1280];   /* enlarged for fault_reason field */
         gui_build_status_json(json, sizeof(json));
         char resp[1200];
         int n = snprintf(resp, sizeof(resp),
@@ -1160,7 +1179,7 @@ int main(void)
         double pc  = g_sensors.pc_psi;
         pthread_mutex_unlock(&sensor_mutex);
 
-        /* ── 2. Read current state under lock ───────────────────────────── */
+        /* ── 2. Read current state under lock + sensor timeout check ──────── */
         pthread_mutex_lock(&state_mutex);
         g_state.pom_psi = pom;
         g_state.pfm_psi = pfm;
@@ -1169,6 +1188,33 @@ int main(void)
         bool   ctrl_en    = g_state.control_enabled &&
                             (g_state.state == SYS_RUNNING);
         pthread_mutex_unlock(&state_mutex);
+
+        /* Sensor dropout watchdog — only active when RUNNING.
+         * Computes age of last sensor reading; if older than SENSOR_TIMEOUT_MS
+         * transitions to FAULT.  Protects against silent DAQstra disconnection
+         * during a firing where the controller would otherwise hold stale
+         * pressure and silently wind integrators to wrong positions.          */
+        pthread_mutex_lock(&sensor_mutex);
+        bool    sensor_ever  = g_sensors.ever_updated;
+        struct timespec s_ts = g_sensors.last_update;
+        pthread_mutex_unlock(&sensor_mutex);
+
+        if (ctrl_en && sensor_ever) {
+            struct timespec now_ts;
+            clock_gettime(CLOCK_MONOTONIC, &now_ts);
+            double age_ms = (now_ts.tv_sec  - s_ts.tv_sec ) * 1e3 +
+                            (now_ts.tv_nsec - s_ts.tv_nsec) * 1e-6;
+            if (age_ms > (double)SENSOR_TIMEOUT_MS) {
+                pthread_mutex_lock(&state_mutex);
+                if (g_state.state == SYS_RUNNING) {
+                    g_state.state = SYS_FAULT;
+                    snprintf(g_state.fault_reason, sizeof(g_state.fault_reason),
+                             "SENSOR DROPOUT: last reading %.0f ms ago", age_ms);
+                    fprintf(stderr, "[FAULT] %s\n", g_state.fault_reason);
+                }
+                pthread_mutex_unlock(&state_mutex);
+            }
+        }
 
         /* ── 3. Feed Simulink inputs ─────────────────────────────────────── */
         tv_controller_2_1_U.thrust_lbf_set_inport = thrust_set;

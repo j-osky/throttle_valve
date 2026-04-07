@@ -672,8 +672,14 @@ async function sendCmd(cmd) {
       stop:   'Halt — valves closed to 0°',
       estop:  'EMERGENCY STOP'
     };
-    if (r.ok) log(labels[cmd] || ('Command: ' + cmd.toUpperCase()), cmd === 'estop' ? 'lerr' : 'lok');
-    else      log('Command ' + cmd + ' failed — HTTP ' + r.status, 'lerr');
+    if (r.ok) {
+      log(labels[cmd] || ('Command: ' + cmd.toUpperCase()), cmd === 'estop' ? 'lerr' : 'lok');
+    } else if (r.status === 400) {
+      const msg = await r.text();
+      log('⚠ ' + msg, 'lerr');
+    } else {
+      log('Command ' + cmd + ' failed — HTTP ' + r.status, 'lerr');
+    }
   } catch(e) { log('Command error: ' + e.message, 'lerr'); }
 }
 
@@ -729,7 +735,7 @@ async function poll() {
         INIT_IC: 'Initialising ICs — driving valves to 500 lbf positions',
         ARMED:   'Armed — system confirmed ready, awaiting Fire command',
         RUNNING: 'Running — closed-loop control active at 10 Hz',
-        FAULT:   'Fault — valve FMI error detected, valves safe',
+        FAULT:   'Fault — ' + (d.fault_reason || 'valve FMI error detected') + ', valves safe',
         ESTOP:   'Emergency Stop — power cycle required to clear'
       };
       log('State → ' + d.state + ' (' + (stateDesc[d.state]||'') + ')', cls);

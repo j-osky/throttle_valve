@@ -482,9 +482,21 @@ static void can_configure_periodic(void)
 
 /* ── Send absolute percent command to both valves (Prop A mode) ──────────── *
  * Converts the controller's degree output to percent of full open (0-100).  *
- * 1 count = 0.9 deg effective resolution (1% × 90°).                       */
+ * 1 count = 0.9 deg effective resolution (1% × 90°).                       *
+ *                                                                            *
+ * Deadband: only sends a new command if the rounded percent differs from     *
+ * the last sent value.  Prevents the PI from toggling the valve between      *
+ * adjacent counts (e.g. 44%↔45%) when the controller output sits near a     *
+ * rounding boundary.  Without this, continuous ±1 count dither causes       *
+ * FMI 7 (position timeout) because the valve never settles at its target.   *
+ * Accuracy cost: up to 0.9° steady-state error; the PI integrator           *
+ * compensates once it accumulates enough error to cross to the next count.  */
 static void can_send_valve_commands(double lox_deg, double ipa_deg)
 {
+    /* Last-sent percent values — persist across calls for deadband check */
+    static uint8_t last_lox_pct = 255;   /* 255 = uninitialised sentinel */
+    static uint8_t last_ipa_pct = 255;
+
     /* Clamp degrees to physical range, convert to percent */
     lox_deg = fmax(VALVE_MIN_DEG, fmin(VALVE_MAX_DEG, lox_deg));
     ipa_deg = fmax(VALVE_MIN_DEG, fmin(VALVE_MAX_DEG, ipa_deg));
@@ -494,13 +506,20 @@ static void can_send_valve_commands(double lox_deg, double ipa_deg)
 
     struct can_frame f;
 
-    f = kz_build_absolute_pct(KZVALVE_SA_LOX, KZVALVE_SA_PI,
-                               lox_pct, MOTOR_SPEED_PCT);
-    can_send_frame(&f);
+    /* Only send if command changed — prevents adjacent-count dither */
+    if (lox_pct != last_lox_pct) {
+        f = kz_build_absolute_pct(KZVALVE_SA_LOX, KZVALVE_SA_PI,
+                                   lox_pct, MOTOR_SPEED_PCT);
+        can_send_frame(&f);
+        last_lox_pct = lox_pct;
+    }
 
-    f = kz_build_absolute_pct(KZVALVE_SA_IPA, KZVALVE_SA_PI,
-                               ipa_pct, MOTOR_SPEED_PCT);
-    can_send_frame(&f);
+    if (ipa_pct != last_ipa_pct) {
+        f = kz_build_absolute_pct(KZVALVE_SA_IPA, KZVALVE_SA_PI,
+                                   ipa_pct, MOTOR_SPEED_PCT);
+        can_send_frame(&f);
+        last_ipa_pct = ipa_pct;
+    }
 }
 
 /* ── Drive both valves to safe state (0° = closed) ──────────────────────── */

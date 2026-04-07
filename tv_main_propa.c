@@ -270,7 +270,10 @@ static inline struct can_frame kz_build_request_propa(
 #define GUI_PORT            8080        /* HTTP server port for gui.html and
                                          * /api/status JSON endpoint.          */
 #define DAQSTRA_BASE        "http://localhost:8050"
-#define CAN_IFACE           "can1"
+/* CAN interface name — set this to match your hardware before building.
+ * Common values: "can0", "can1", "can2"
+ * Check with: ip link show | grep can                                    */
+#define CAN_IFACE           "can0"
 
 /* DAQstra sensor IDs — use exact sensor_id from /api/v1/sensors
  * Example IDs from b1_log_data_ads1256 board (ADS1256 ADC channels).

@@ -480,6 +480,12 @@ static void can_process_rx(void)
                     snprintf(g_state.fault_reason, sizeof(g_state.fault_reason),
                              "%s: valve SA=0x%02X FMI=%u", fmi_name, sa, fmi);
                     fprintf(stderr, "[FAULT] %s\n", g_state.fault_reason);
+                    fprintf(stderr, "[FAULT] At fault: LOX cmd=%.2f act=%u  IPA cmd=%.2f act=%u\n",
+                            g_state.lox_cmd_deg, g_state.lox_actual_deg,
+                            g_state.ipa_cmd_deg, g_state.ipa_actual_deg);
+                    fprintf(stderr, "[FAULT] POM=%.2f PFM=%.2f PC=%.2f thrust_set=%.1f\n",
+                            g_state.pom_psi, g_state.pfm_psi, g_state.pc_psi,
+                            g_state.thrust_lbf_set);
                 }
             }
             pthread_mutex_unlock(&state_mutex);

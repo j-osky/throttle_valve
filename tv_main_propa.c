@@ -1142,6 +1142,29 @@ static void gui_handle_request(int fd, const char *req, size_t req_len)
         return;
     }
 
+    /* POST /api/cmd/reset — clear FAULT or ESTOP back to READY.
+     * Resets FMI counters, fault_reason, and Simulink state.
+     * Operator must re-verify system before arming again.              */
+    if (strncmp(req, "POST /api/cmd/reset", 19) == 0) {
+        pthread_mutex_lock(&state_mutex);
+        if (g_state.state == SYS_FAULT || g_state.state == SYS_ESTOP) {
+            g_state.state                = SYS_READY;
+            g_state.control_enabled      = false;
+            g_state.fault_reason[0]      = '\0';
+            g_state.lox_fmi_timeout_count = 0;
+            g_state.ipa_fmi_timeout_count = 0;
+            g_state.lox_fmi_voltage_count = 0;
+            g_state.ipa_fmi_voltage_count = 0;
+            g_state.lox_fmi_cal_count     = 0;
+            g_state.ipa_fmi_cal_count     = 0;
+            tv_controller_2_1_initialize();
+            printf("[CTRL] Fault cleared by operator — state → READY\n");
+        }
+        pthread_mutex_unlock(&state_mutex);
+        GUI_WRITE(fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK", 41);
+        return;
+    }
+
     /* POST /api/cmd/estop */
     if (strncmp(req, "POST /api/cmd/estop", 19) == 0) {
         pthread_mutex_lock(&state_mutex);

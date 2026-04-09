@@ -237,8 +237,11 @@ main{max-width:1040px;margin:0 auto;padding:24px 20px 48px;
 }
 .btn-estop:hover:not(:disabled){background:#e0342a}
 
-/* Button tooltip labels */
-.btn-desc{font-size:11px;color:var(--text-tertiary);margin-top:4px;line-height:1.4;font-style:italic}
+/* Reset — only enabled in FAULT/ESTOP */
+.btn-reset{color:#6b2f9e;background:var(--purple-lt);border-color:rgba(175,82,222,.3)}
+.btn-reset:hover:not(:disabled){background:#ede0f7}
+
+font-size:11px;color:var(--text-tertiary);margin-top:4px;line-height:1.4;font-style:italic}
 
 /* ── Diagnostics ─────────────────────────────────────────────────────── */
 .diag-bar{
@@ -558,16 +561,19 @@ footer span{font-weight:500;color:var(--text-secondary)}
           </div>
         </div>
 
-        <!-- Row 3: E-Stop -->
+        <!-- Row 3: E-Stop + Reset -->
         <div>
           <div class="btn-row">
             <button class="btn btn-estop" onclick="sendEstop()">
               &#9889; Emergency Stop
             </button>
+            <button class="btn btn-reset" id="btn_reset" onclick="sendReset()" disabled>
+              &#8635; Reset Fault
+            </button>
           </div>
           <div class="btn-desc">
-            Immediately closes both valves and locks system into
-            ESTOP state. Requires power cycle to clear.
+            <strong>E-Stop</strong> — immediately closes both valves, locks system. Power cycle to clear.&nbsp;&nbsp;
+            <strong>Reset Fault</strong> — clears FAULT/ESTOP back to READY. Re-verify system before arming.
           </div>
         </div>
 
@@ -725,6 +731,7 @@ async function sendCmd(cmd) {
       arm:    'Armed — ready to fire',
       run:    'Fire — control loop enabled',
       stop:   'Halt — valves closed to 0°',
+      reset:  'Fault cleared — system returned to READY',
       estop:  'EMERGENCY STOP'
     };
     if (r.ok) {
@@ -739,6 +746,7 @@ async function sendCmd(cmd) {
 }
 
 async function sendEstop() { log('EMERGENCY STOP TRIGGERED', 'lerr'); await sendCmd('estop'); }
+async function sendReset() { log('Fault reset by operator — returning to READY', 'lwarn'); await sendCmd('reset'); }
 
 /* ── DOM helpers ─────────────────────────────────────────────────────── */
 function set(id, v) { const e = document.getElementById(id); if(e) e.textContent = v; }
@@ -777,6 +785,10 @@ async function poll() {
     document.getElementById('conn_pill').className = 'conn-pill ok';
     set('conn_label', 'Connected');
     if (!pollOk) { log('Controller connected', 'lok'); pollOk = true; }
+
+    /* Reset button — only enabled in FAULT or ESTOP */
+    const resetBtn = document.getElementById('btn_reset');
+    if (resetBtn) resetBtn.disabled = !(d.state === 'FAULT' || d.state === 'ESTOP');
 
     const badge = document.getElementById('state_badge');
     badge.textContent = d.state;

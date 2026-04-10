@@ -1,66 +1,50 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-mock_can_bridge.py — Josh Throttle Mock CAN Bridge
+mock_can_bridge.py — Josh Throttle Mock CAN Bridge  (Linux + Windows)
 =============================================================================
 
 PURPOSE
 -------
-This script is the third component of the bench test mock stack.  It sits
-between tv_main.c (which talks to can1) and mock_daq.py (which serves
-sensor data) and makes both of them think they are talking to real hardware.
+This script is the bench test mock stack CAN bridge.  It sits between
+tv_main_propa_win.exe (or tv_main_propa on Linux) and mock_daq.py, making
+both think they are talking to real KZValve EH22 actuators.
 
 WHAT IT SIMULATES
 -----------------
 1. TWO KZValve EH22 ACTUATORS (LOX at 0xBE, IPA at 0xBF)
-   - Sends J1939 address claim frames at startup so tv_main's valve_init_sequence()
+   - Sends J1939 address claim frames at startup so tv_main's init sequence
      finds both valves on the bus and advances to READY state.
-   - Listens for Prop A2 absolute degree commands from tv_main.
-   - Simulates the valve's PHYSICAL RESPONSE: the actual angle slews toward the
-     commanded angle at 60 deg/s (the real EH22 1.5S max slew rate at full speed).
-     This means a command to change angle by 10° takes 10/60 = 167ms to complete,
-     just like the real valve.
-   - Sends Prop A2 feedback frames back to tv_main every 100ms with:
-       data[2] = simulated actual angle (degrees)  ← the process variable
-       data[5] = FMI = 0 (no fault)                ← normal operation
+   - Listens for Prop A (percent) or Prop A2 (degree) commands.
+   - Simulates the valve PHYSICAL RESPONSE: slews at 60 deg/s toward command.
+   - Sends feedback frames every 100ms with actual position and FMI=0.
 
 2. PHYSICS MODEL COUPLING
-   - After each slew step, pushes the simulated actual valve angles to
-     mock_daq.py via POST /mock/valve_angles.
-   - This causes mock_daq.py to recompute POM, PFM, PC from the new valve angles.
-   - tv_main then reads these updated pressures, runs the PI controller,
-     and sends new valve commands — completing the closed loop.
-
-CLOSED-LOOP DATA FLOW (bench testing)
---------------------------------------
-  tv_main (170 Hz)
-    ├─ Reads POM/PFM/PC from mock_daq.py (HTTP)
-    ├─ Runs tv_controller_2_1_step()
-    └─ Every 17th tick (10 Hz): sends Prop A2 command to can1
-           ↓ CAN frame on can1
-  mock_can_bridge (this script)
-    ├─ Parses commanded angle from Byte 1
-    ├─ Slews simulated valve at 60 deg/s toward command
-    ├─ Posts actual valve angles to mock_daq.py (HTTP, 10 Hz)
-    │      ↓ HTTP POST /mock/valve_angles
-    │  mock_daq.py recomputes POM/PFM/PC from new angles
-    └─ Sends Prop A2 feedback frame back to can1
-           ↓ CAN frame on can1
-  tv_main receives feedback, logs actual position, checks FMI
-  (loop continues...)
+   - Pushes simulated valve angles to mock_daq.py at 170 Hz.
+   - mock_daq.py recomputes POM/PFM/PC from these angles.
+   - tv_main reads updated pressures and closes the loop.
 
 REQUIREMENTS
 ------------
-  pip3 install python-can requests
+  pip install python-can requests
+
+  For Windows with PCAN-USB Pro (no virtual CAN needed):
+    pip install python-can[pcan]
+    Install PEAK drivers: PCAN_USB_Setup.exe from peak-system.com
+
+  For Linux (virtual CAN bench):
+    sudo modprobe vcan && sudo ip link add dev can0 type vcan && sudo ip link set up can0
 
 USAGE
 -----
-  python3 mock_can_bridge.py [--iface can1] [--daq http://localhost:8050]
+  # Linux virtual CAN (bench):
+  python3 mock_can_bridge.py --iface can0
 
-  Default interface is can1.  Use vcan1/can1 virtual interface for bench:
-    sudo modprobe vcan
-    sudo ip link add dev can1 type vcan
-    sudo ip link set up can1
+  # Windows PCAN-USB Pro (bench):
+  python3 mock_can_bridge.py --iface PCAN_USBBUS1 --backend pcan
+
+  # Windows second port:
+  python3 mock_can_bridge.py --iface PCAN_USBBUS2 --backend pcan
 """
 
 import argparse
@@ -85,33 +69,34 @@ SA_PI  = 0x01   # Pi ECU source address (1)
 
 def is_prop_a2_cmd(msg) -> Optional[Tuple[int, int]]:
     """
-    Determine whether a received CAN message is a Prop A2 Absolute Mode command
-    directed at one of our simulated valves.
+    Determine whether a received CAN message is a Prop A or Prop A2 Absolute
+    Mode command directed at one of our simulated valves.
 
-    J1939 Prop A2 frame identification:
-      - Must be extended frame (29-bit ID)
-      - DP bit [24] = 1  (Data Page 1 = Prop A2 degrees mode)
-      - PF = 0xEF [23:16] (PDU Format for Proprietary A/A2)
-      - data[3] = 0x00    (Mode byte = Absolute position mode)
-      - DLC = 8           (always 8 bytes for Prop A/A2)
+    Accepts both:
+      Prop A  (DP=0, PGN 0x00EF00): percent of full open — used by tv_main_propa
+      Prop A2 (DP=1, PGN 0x01EF00): degrees              — used by tv_main
+
+    Common requirements:
+      - Extended frame (29-bit ID)
+      - PF = 0xEF
+      - data[3] = 0x00 (Absolute position mode)
+      - DLC = 8
 
     Returns:
       (dest_sa, src_sa) tuple if this is a valid absolute command, else None.
-      dest_sa will be SA_LOX or SA_IPA if the command is for one of our valves.
     """
     if not msg.is_extended_id:
-        return None   # Only handle 29-bit extended frames
+        return None
 
     eid = msg.arbitration_id
-    # Extract the relevant fields from the 29-bit EID
-    pf  = (eid >> 16) & 0xFF   # PDU Format byte
-    dp  = (eid >> 24) & 0x01   # Data Page bit (0=percent, 1=degrees)
-    sa  = eid & 0xFF            # Source address (who sent it)
-    da  = (eid >> 8) & 0xFF    # Destination address (PS byte for PDU1)
+    pf  = (eid >> 16) & 0xFF
+    sa  = eid & 0xFF
+    da  = (eid >> 8) & 0xFF
 
-    if pf == 0xEF and dp == 1 and len(msg.data) == 8:
-        mode = msg.data[3]     # Byte 4 = mode
-        if mode == 0x00:       # 0x00 = Absolute position mode
+    # Accept both DP=0 (Prop A percent) and DP=1 (Prop A2 degrees)
+    if pf == 0xEF and len(msg.data) == 8:
+        mode = msg.data[3]
+        if mode == 0x00:   # Absolute position mode
             return da, sa
     return None
 
@@ -120,42 +105,36 @@ def is_prop_a2_cmd(msg) -> Optional[Tuple[int, int]]:
 # FRAME BUILDER: build_prop_a2_feedback
 # =============================================================================
 
-def build_prop_a2_feedback(src_sa: int, pi_sa: int,
-                            actual_deg: float, cmd_deg: float,
-                            speed_pct: int) -> can.Message:
+def build_prop_feedback(src_sa: int, pi_sa: int,
+                         actual_deg: float, cmd_deg: float,
+                         speed_pct: int, prop_a: bool = False) -> can.Message:
     """
-    Build a Prop A2 position feedback frame that mimics what the real EH22
-    valve sends back to tv_main (KZValve manual Section 8.1).
+    Build a Prop A or Prop A2 position feedback frame.
 
-    This is the response format the valve uses for BOTH:
-      - Replies to Request PGN
-      - Unsolicited periodic broadcasts (after periodic_cfg is configured)
+    prop_a=False (default): Prop A2 (DP=1) — degrees mode
+      data[0]: commanded angle in degrees
+      data[2]: actual position in degrees
 
-    Wire format (8 bytes, Prop A2 direction valve→Pi):
-      Byte 1 (data[0]): Commanded position echo in degrees
-                         (what the valve thinks Pi last commanded — echo back)
-      Byte 2 (data[1]): Commanded motor speed echo (%)
-      Byte 3 (data[2]): ACTUAL current position in degrees
-                         *** This is the process variable tv_main reads ***
-                         tv_main's PI controller uses this to compute error.
-      Byte 4 (data[3]): 0xFF (mode, not meaningful in response)
-      Byte 5 (data[4]): Measured supply voltage, rounded to nearest Volt
-                         (we always report 24V for the mock)
-      Byte 6 (data[5]): FMI — Fault Mode Indicator
-                         0 = no fault (what mock always reports)
-                         See kzvalve_can.h FMI_* constants for fault values
-      Bytes 7-8:         0xFF (reserved)
+    prop_a=True: Prop A (DP=0) — percent mode
+      data[0]: commanded position as percent (0-100)
+      data[2]: actual position as percent (0-100)
 
-    The EID is constructed with the valve as source (src_sa) and Pi as dest:
-      EID = (6<<26)|(0<<25)|(1<<24)|(0xEF<<16)|(pi_sa<<8)|src_sa
-          = 0x19EF0100 | (pi_sa<<8) | src_sa  (for Pi=0x01)
+    Both use the same EID structure with the appropriate DP bit.
     """
-    eid = (6 << 26) | (0 << 25) | (1 << 24) | (0xEF << 16) | (pi_sa << 8) | src_sa
+    dp  = 0 if prop_a else 1
+    eid = (6 << 26) | (0 << 25) | (dp << 24) | (0xEF << 16) | (pi_sa << 8) | src_sa
+
+    if prop_a:
+        cmd_val    = int(max(0, min(100, round(cmd_deg    / 90.0 * 100.0))))
+        actual_val = int(max(0, min(100, round(actual_deg / 90.0 * 100.0))))
+    else:
+        cmd_val    = int(max(0, min(255, cmd_deg)))
+        actual_val = int(max(0, min(255, actual_deg)))
 
     data = bytearray(8)
-    data[0] = int(max(0, min(255, cmd_deg)))    # Byte 1: commanded angle echo
-    data[1] = int(max(50, min(100, speed_pct))) # Byte 2: speed echo
-    data[2] = int(max(0, min(255, actual_deg))) # Byte 3: ACTUAL position (deg)
+    data[0] = cmd_val                            # Byte 1: commanded position echo
+    data[1] = int(max(50, min(100, speed_pct)))  # Byte 2: speed echo
+    data[2] = actual_val                         # Byte 3: ACTUAL position
     data[3] = 0xFF                               # Byte 4: mode (0xFF in response)
     data[4] = 24                                 # Byte 5: 24V supply voltage
     data[5] = 0                                  # Byte 6: FMI = 0 (no fault)
@@ -168,6 +147,10 @@ def build_prop_a2_feedback(src_sa: int, pi_sa: int,
         is_extended_id=True,
         is_remote_frame=False
     )
+
+# Keep old name as alias for Prop A2 (backward compat with any callers)
+def build_prop_a2_feedback(src_sa, pi_sa, actual_deg, cmd_deg, speed_pct):
+    return build_prop_feedback(src_sa, pi_sa, actual_deg, cmd_deg, speed_pct, prop_a=False)
 
 
 # =============================================================================
@@ -188,9 +171,10 @@ class MockCANBridge:
     # = 90 degrees / 1.5 seconds = 60 degrees per second
     SLEW_RATE_DEG_PER_SEC = 60.0
 
-    def __init__(self, iface: str, daq_url: str):
+    def __init__(self, iface: str, daq_url: str, backend: str = "socketcan"):
         self.iface   = iface
         self.daq_url = daq_url.rstrip("/")
+        self.backend = backend
         self.bus     = None
 
         # Start valves at 0 deg (closed/unknown).
@@ -200,13 +184,28 @@ class MockCANBridge:
         self.ipa_actual = 0.0
         self.lox_cmd    = 0.0
         self.ipa_cmd    = 0.0
+        # Track whether each valve is being commanded in Prop A (percent) mode
+        self.lox_prop_a = False
+        self.ipa_prop_a = False
 
         self.last_t = time.monotonic()
 
     def connect(self):
-        """Open the SocketCAN interface via python-can."""
-        self.bus = can.interface.Bus(channel=self.iface, interface="socketcan")
-        print(f"[Bridge] Connected to CAN interface: {self.iface}")
+        """Open the CAN interface via python-can.
+
+        On Linux: uses socketcan backend (can0, can1, vcan0, etc.)
+        On Windows: uses pcan backend (PCAN_USBBUS1, PCAN_USBBUS2, etc.)
+
+        The backend is set by --backend argument (default: socketcan on Linux,
+        pcan on Windows).  python-can handles the difference transparently.
+        """
+        kwargs = {"channel": self.iface, "interface": self.backend,
+                  "bitrate": 250000}
+        # socketcan does not need bitrate (set on the interface), pcan does
+        if self.backend == "socketcan":
+            del kwargs["bitrate"]
+        self.bus = can.interface.Bus(**kwargs)
+        print(f"[Bridge] Connected: interface={self.backend} channel={self.iface}")
 
     def slew_valves(self):
         """
@@ -256,15 +255,15 @@ class MockCANBridge:
 
     def send_feedback(self):
         """
-        Transmit Prop A2 position feedback frames for both simulated valves.
-        These frames flow from valve → Pi (src=valve SA, dest=Pi SA).
-        tv_main's can_process_rx() receives them and updates:
-          g_state.lox_actual_deg, g_state.ipa_actual_deg, g_state.lox_fmi, ...
+        Transmit position feedback frames for both simulated valves.
+        Uses Prop A (percent) or Prop A2 (degrees) to match the command mode.
         """
-        lox_fb = build_prop_a2_feedback(SA_LOX, SA_PI,
-                                         self.lox_actual, self.lox_cmd, 100)
-        ipa_fb = build_prop_a2_feedback(SA_IPA, SA_PI,
-                                         self.ipa_actual, self.ipa_cmd, 100)
+        lox_fb = build_prop_feedback(SA_LOX, SA_PI,
+                                      self.lox_actual, self.lox_cmd, 100,
+                                      prop_a=self.lox_prop_a)
+        ipa_fb = build_prop_feedback(SA_IPA, SA_PI,
+                                      self.ipa_actual, self.ipa_cmd, 100,
+                                      prop_a=self.ipa_prop_a)
         try:
             self.bus.send(lox_fb)
             self.bus.send(ipa_fb)
@@ -356,7 +355,7 @@ class MockCANBridge:
 
         threading.Thread(target=feedback_loop, daemon=True).start()
 
-        print(f"[Bridge] Listening for Prop A2 commands on {self.iface}...")
+        print(f"[Bridge] Listening for Prop A / Prop A2 commands on {self.iface} ({self.backend})...")
         print(f"[Bridge] Will relay valve angles to {self.daq_url}")
 
         # Main thread: receive and parse CAN frames
@@ -377,8 +376,9 @@ class MockCANBridge:
             #   DP=0 (Prop A,  0x18EF...): value is percent  (0-100) → convert to degrees
             eid     = msg.arbitration_id
             dp_bit  = (eid >> 24) & 0x1
+            prop_a  = (dp_bit == 0)
             raw_val = float(msg.data[0])
-            deg     = raw_val if dp_bit == 1 else raw_val * 90.0 / 100.0
+            deg     = raw_val if not prop_a else raw_val * 90.0 / 100.0
 
             # Apply a 0.5 deg deadband: only update cmd if the new value differs
             # by more than 0.5 deg from current.  This prevents 1-count integer
@@ -386,9 +386,11 @@ class MockCANBridge:
             # from continuously slewing the simulated valve back and forth.
             DEADBAND = 0.5
             if da == SA_LOX:
+                self.lox_prop_a = prop_a
                 if abs(deg - self.lox_cmd) > DEADBAND:
                     self.lox_cmd = deg
             elif da == SA_IPA:
+                self.ipa_prop_a = prop_a
                 if abs(deg - self.ipa_cmd) > DEADBAND:
                     self.ipa_cmd = deg
             # Ignore commands addressed to other devices
@@ -399,12 +401,20 @@ class MockCANBridge:
 # =============================================================================
 
 if __name__ == "__main__":
+    import platform
+    default_backend = "pcan" if platform.system() == "Windows" else "socketcan"
+    default_iface   = "PCAN_USBBUS1" if platform.system() == "Windows" else "can0"
+
     ap = argparse.ArgumentParser(description="Josh Throttle Mock CAN Bridge")
-    ap.add_argument("--iface", default="can1",
-                    help="SocketCAN interface name (default: can1)")
-    ap.add_argument("--daq",   default="http://localhost:8050",
+    ap.add_argument("--iface",   default=default_iface,
+                    help=f"CAN interface (default: {default_iface}). "
+                         "Linux: can0/can1/vcan0. Windows: PCAN_USBBUS1/PCAN_USBBUS2")
+    ap.add_argument("--daq",     default="http://localhost:8050",
                     help="mock_daq.py base URL (default: http://localhost:8050)")
+    ap.add_argument("--backend", default=default_backend,
+                    help=f"python-can backend (default: {default_backend}). "
+                         "Linux: socketcan. Windows: pcan")
     args = ap.parse_args()
 
-    bridge = MockCANBridge(args.iface, args.daq)
+    bridge = MockCANBridge(args.iface, args.daq, backend=args.backend)
     bridge.run()

@@ -1,0 +1,112 @@
+# =============================================================================
+# Makefile.win — Build tv_main_propa_win.exe with MinGW-w64
+# =============================================================================
+#
+# PREREQUISITES
+# -------------
+# 1. MinGW-w64 toolchain
+#    Recommended: MSYS2 (https://www.msys2.org)
+#    Install: pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-make
+#
+# 2. pthreads-win32
+#    Included with MinGW-w64 — no separate install needed.
+#
+# 3. libcurl for Windows
+#    Download: https://curl.se/windows
+#    Extract and copy:
+#      libcurl-x64/bin/libcurl-x64.dll  →  rename to libcurl.dll, place beside exe
+#      libcurl-x64/lib/libcurl.dll.a    →  place in this directory (link library)
+#      libcurl-x64/include/curl/        →  place in this directory
+#
+# 4. PEAK PCAN-Basic SDK
+#    Download: https://www.peak-system.com/PCAN-Basic.239.0.html
+#    After install, copy from the SDK directory:
+#      PCAN-Basic API\Win64\PCANBasic.dll   →  place beside exe
+#      PCAN-Basic API\Win64\PCANBasic.lib   →  place in this directory (or use .dll.a)
+#    MinGW import library can be generated from the DLL if needed:
+#      gendef PCANBasic.dll
+#      dlltool -d PCANBasic.def -l libPCANBasic.a
+#
+# 5. PCAN-USB Pro driver
+#    Download PCAN_USB_Setup.exe from peak-system.com and install.
+#
+# DIRECTORY LAYOUT
+# ----------------
+# Place all of the following in the same directory:
+#   tv_main_propa_win.c
+#   tv_controller_2_1.c
+#   tv_controller_2_1.h
+#   tv_controller_2_1_data.c
+#   tv_controller_2_1_private.h
+#   tv_controller_2_1_types.h
+#   kzvalve_can.h
+#   win_compat.h
+#   pcan_basic.h
+#   libcurl.dll.a  (or libcurl-x64.dll.a)
+#   libPCANBasic.a  (or PCANBasic.lib renamed)
+#   curl/          (include directory with curl.h)
+#   Makefile.win
+#
+# BUILD
+# -----
+#   mingw32-make -f Makefile.win
+#
+# Or from MSYS2 MinGW64 shell:
+#   make -f Makefile.win
+#
+# RUN
+# ---
+#   Copy to exe directory: libcurl.dll, PCANBasic.dll
+#   tv_main_propa_win.exe
+#   (gui.html must be in the same directory)
+# =============================================================================
+
+CC      = gcc
+TARGET  = tv_main_propa_win.exe
+
+SRCS    = tv_main_propa_win.c \
+          tv_controller_2_1.c \
+          tv_controller_2_1_data.c
+
+OBJS    = $(SRCS:.c=.o)
+
+# Compiler flags
+CFLAGS  = -O2 -Wall -Wextra -std=c11 \
+          -I. \
+          -DWIN32 -D_WIN32_WINNT=0x0602
+
+# Linker flags
+# Order matters: list libs after objects
+LDFLAGS = -lws2_32 \
+          -lpthread \
+          -lcurl \
+          -lPCANBasic \
+          -lm
+
+# Default target
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+	@echo ""
+	@echo "Build successful: $(TARGET)"
+	@echo ""
+	@echo "Before running, ensure these DLLs are in the same directory:"
+	@echo "  libcurl.dll"
+	@echo "  PCANBasic.dll"
+	@echo "  gui.html"
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	del /Q $(OBJS) $(TARGET) 2>NUL || rm -f $(OBJS) $(TARGET)
+
+# Generate a MinGW import library from PCANBasic.dll (run once if needed)
+# Requires gendef and dlltool (included in MinGW-w64 / MSYS2)
+pcan_import_lib:
+	gendef PCANBasic.dll
+	dlltool -d PCANBasic.def -l libPCANBasic.a
+	@echo "Generated libPCANBasic.a"
+
+.PHONY: all clean pcan_import_lib

@@ -180,13 +180,15 @@
 #define CAN_RTR_FLAG  0x40000000u
 #define CAN_ERR_FLAG  0x20000000u
 
-typedef struct {
+/* On Windows, struct can_frame is defined here as a shim for SocketCAN.
+ * Name the struct tag 'can_frame' directly — no macro alias needed.
+ * kzvalve_can.h uses 'struct can_frame' which resolves to this.         */
+struct can_frame {
     uint32_t can_id;   /* EID with CAN_EFF_FLAG OR'd in */
     uint8_t  can_dlc;  /* Data Length Code (0..8)       */
     uint8_t  __pad[3];
     uint8_t  data[8];  /* Payload                       */
-} can_frame_t;
-#define can_frame can_frame_t
+};
 
 #include "tv_controller_2_1.h"
 #include "kzvalve_can.h"

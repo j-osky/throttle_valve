@@ -71,13 +71,21 @@ SRCS    = tv_main_propa_win.c \
 OBJS    = $(SRCS:.c=.o)
 
 # Compiler flags
+# Update CURL_DIR to match where you extracted libcurl for Windows
+# e.g. C:/dev/curl or ./curl-win64
+CURL_DIR = ./curl-win64
+
 CFLAGS  = -O2 -Wall -Wextra -std=c11 \
           -I. \
-          -DWIN32 -D_WIN32_WINNT=0x0602
+          -I$(CURL_DIR)/include \
+          -DWIN32 -D_WIN32 -D_WIN32_WINNT=0x0602
 
 # Linker flags
 # Order matters: list libs after objects
-LDFLAGS = -lws2_32 \
+# Linker flags — add library search paths
+LDFLAGS = -L$(CURL_DIR)/lib \
+          -L. \
+          -lws2_32 \
           -lpthread \
           -lcurl \
           -lPCANBasic \

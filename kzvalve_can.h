@@ -96,7 +96,12 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+/* On Linux use the real SocketCAN header.
+ * On Windows the can_frame shim and CAN_*_FLAG defines are provided by
+ * tv_main_propa_win.c before this header is included, so skip this.      */
+#ifndef _WIN32
 #include <linux/can.h>   /* struct can_frame, CAN_EFF_FLAG, CAN_RTR_FLAG */
+#endif
 
 /* ============================================================================
  * J1939 ADDRESS CONSTANTS

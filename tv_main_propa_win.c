@@ -306,9 +306,9 @@ static inline struct can_frame kz_build_request_propa(
  * Example IDs from b1_log_data_ads1256 board (ADS1256 ADC channels).
  * # must be URL-encoded as %23 in the REST path.
  * Update these to match your actual board/channel wiring.           */
-#define SENSOR_ID_POM  "b1_log_data_ads1256%230"  /* LOX manifold (psi) */
-#define SENSOR_ID_PFM  "b1_log_data_ads1256%231"  /* IPA manifold (psi) */
-#define SENSOR_ID_PC   "b1_log_data_ads1256%232"  /* Chamber     (psi) */
+#define SENSOR_ID_POM  "b1_log_data_ads1256%231"  /* LOX manifold (psi) */
+#define SENSOR_ID_PFM  "b1_log_data_ads1256%232"  /* IPA manifold (psi) */
+#define SENSOR_ID_PC   "b1_log_data_ads1256%233"  /* Chamber     (psi) */
 
 /* Valve initial conditions at 500 lbf operating point.
  * These are theta_o (LOX) and theta_f (IPA) from gain_scheduling.m, run at

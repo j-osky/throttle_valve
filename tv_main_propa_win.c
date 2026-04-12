@@ -300,7 +300,7 @@ static inline struct can_frame kz_build_request_propa(
  *   PCAN_USBBUS2 (0x52) — second CAN port
  * Use PCAN-View (free from peak-system.com) to identify which port
  * is connected to the valve CAN bus.                                     */
-#define CAN_CHANNEL         PCAN_USBBUS1
+#define CAN_CHANNEL         PCAN_USBBUS2
 
 /* DAQstra sensor IDs — use exact sensor_id from /api/v1/sensors
  * Example IDs from b1_log_data_ads1256 board (ADS1256 ADC channels).
@@ -1349,6 +1349,9 @@ int main(void)
     signal(SIGINT,  sig_handler);
     /* SIGTERM is not available on Windows — SIGINT covers Ctrl+C      */
 
+    /* ── Initialise Winsock2 FIRST — curl and GUI threads need it ──────── */
+    winsock_init();
+
     /* ── Initialise libcurl ─────────────────────────────────────────────── */
     curl_global_init(CURL_GLOBAL_ALL);
 
@@ -1370,9 +1373,6 @@ int main(void)
     /* Give the sensor thread time to populate the cache before the
      * control loop starts — one full read cycle takes ~3 × 5ms = 15ms.   */
     usleep(100000);   /* 100 ms — guarantees at least one full cache fill   */
-
-    /* ── Initialise Winsock2 (required before any socket calls) ────────── */
-    winsock_init();
 
     /* ── Open PCAN-USB Pro via PCAN-Basic SDK ───────────────────────────── */
     if (can_open(CAN_CHANNEL) < 0) {

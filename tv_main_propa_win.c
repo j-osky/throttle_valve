@@ -168,7 +168,7 @@
 #include <time.h>
 #include <errno.h>
 #include <signal.h>
-#include <pthread.h>       /* MinGW-w64 pthreads — link with -lpthread  */
+#include <pthread.h>       /* included via win_compat.h — link with -lpthread */
 #include <curl/curl.h>     /* libcurl for Windows  — link with -lcurl   */
 
 /* ── can_frame shim (must precede kzvalve_can.h) ───────────────────────── *
@@ -361,7 +361,7 @@ typedef struct {
     bool            ever_updated;  /* false until first real reading arrives  */
 } SensorCache;
 
-static SensorCache       g_sensors  = {322.8241, 370.7493, 370.8182, {0,0}, false};
+static SensorCache       g_sensors  = {370.7493, 370.8182, 322.8241, {0,0}, false};
 static pthread_mutex_t   sensor_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ── Valve angle cache — written by can_process_rx(), read by daq_push_thread ──
@@ -525,6 +525,11 @@ static void can_configure_periodic(void)
            CAN_PERIOD_MS);
 }
 
+/* Deadband state — file scope so can_drive_safe() can reset them.
+ * Reset to 255 (sentinel) forces the next command to always send.     */
+static uint8_t g_last_lox_pct = 255;
+static uint8_t g_last_ipa_pct = 255;
+
 /* ── Send absolute percent command to both valves (Prop A mode) ──────────── *
  * Converts the controller's degree output to percent of full open (0-100).  *
  * 1 count = 0.9 deg effective resolution (1% × 90°).                       *
@@ -538,9 +543,7 @@ static void can_configure_periodic(void)
  * compensates once it accumulates enough error to cross to the next count.  */
 static void can_send_valve_commands(double lox_deg, double ipa_deg)
 {
-    /* Last-sent percent values — persist across calls for deadband check */
-    static uint8_t last_lox_pct = 255;   /* 255 = uninitialised sentinel */
-    static uint8_t last_ipa_pct = 255;
+    /* Last-sent percent values — see file-scope g_last_lox_pct / g_last_ipa_pct */
 
     /* Clamp degrees to physical range, convert to percent */
     lox_deg = fmax(VALVE_MIN_DEG, fmin(VALVE_MAX_DEG, lox_deg));
@@ -552,18 +555,18 @@ static void can_send_valve_commands(double lox_deg, double ipa_deg)
     struct can_frame f;
 
     /* Only send if command changed — prevents adjacent-count dither */
-    if (lox_pct != last_lox_pct) {
+    if (lox_pct != g_last_lox_pct) {
         f = kz_build_absolute_pct(KZVALVE_SA_LOX, KZVALVE_SA_PI,
                                    lox_pct, MOTOR_SPEED_PCT);
         can_send_frame(&f);
-        last_lox_pct = lox_pct;
+        g_last_lox_pct = lox_pct;
     }
 
-    if (ipa_pct != last_ipa_pct) {
+    if (ipa_pct != g_last_ipa_pct) {
         f = kz_build_absolute_pct(KZVALVE_SA_IPA, KZVALVE_SA_PI,
                                    ipa_pct, MOTOR_SPEED_PCT);
         can_send_frame(&f);
-        last_ipa_pct = ipa_pct;
+        g_last_ipa_pct = ipa_pct;
     }
 }
 
@@ -573,6 +576,9 @@ static void can_drive_safe(void)
     /* Send 0-degree command to both valves.  The printf is rate-limited so
      * it fires only once per transition into safe state, not 170x/sec.     */
     static SystemState last_safe_state = (SystemState)-1;  /* sentinel: no state yet */
+    /* Reset deadband so the next can_send_valve_commands call always sends. */
+    g_last_lox_pct = 255;
+    g_last_ipa_pct = 255;
     struct can_frame f;
     f = kz_build_absolute_pct(KZVALVE_SA_LOX, KZVALVE_SA_PI, 0, 100);
     can_send_frame(&f);

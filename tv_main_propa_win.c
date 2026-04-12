@@ -293,22 +293,22 @@ static inline struct can_frame kz_build_request_propa(
                                          * 100 ms without polling.             */
 #define GUI_PORT            8080        /* HTTP server port for gui.html and
                                          * /api/status JSON endpoint.          */
-#define DAQSTRA_BASE        "http://localhost:8050"
+#define DAQSTRA_BASE        "http://127.0.0.1:8050"
 /* PCAN-USB Pro channel — set this before building.
  * Common values:
  *   PCAN_USBBUS1 (0x51) — first CAN port   (default)
  *   PCAN_USBBUS2 (0x52) — second CAN port
  * Use PCAN-View (free from peak-system.com) to identify which port
  * is connected to the valve CAN bus.                                     */
-#define CAN_CHANNEL         PCAN_USBBUS2
+#define CAN_CHANNEL         PCAN_USBBUS1
 
 /* DAQstra sensor IDs — use exact sensor_id from /api/v1/sensors
  * Example IDs from b1_log_data_ads1256 board (ADS1256 ADC channels).
  * # must be URL-encoded as %23 in the REST path.
  * Update these to match your actual board/channel wiring.           */
-#define SENSOR_ID_POM  "b1_log_data_ads1256%231"  /* LOX manifold (psi) */
-#define SENSOR_ID_PFM  "b1_log_data_ads1256%232"  /* IPA manifold (psi) */
-#define SENSOR_ID_PC   "b1_log_data_ads1256%233"  /* Chamber     (psi) */
+#define SENSOR_ID_POM  "b1_log_data_ads1256%231"  /* LOX manifold (psi) — channel 1 */
+#define SENSOR_ID_PFM  "b1_log_data_ads1256%231" /* IPA manifold (psi) — channel 0 */
+#define SENSOR_ID_PC   "b1_log_data_ads1256%232"  /* Chamber     (psi) — channel 2 */
 
 /* Valve initial conditions at 500 lbf operating point.
  * These are theta_o (LOX) and theta_f (IPA) from gain_scheduling.m, run at
@@ -724,32 +724,23 @@ static size_t curl_write_cb(void *data, size_t sz, size_t n, void *userp)
 
 #define DAQSTRA_MAX_URL 512
 
-/* daqstra_init_handle — configure a persistent CURL handle for one sensor.
- * url_buf must be a caller-owned buffer of at least DAQSTRA_MAX_URL bytes
- * that outlives the handle — CURLOPT_URL does not copy the string.         */
-static void daqstra_init_handle(CURL *c, const char *sensor_id, char *url_buf)
+/* daqstra_fetch — fetch one sensor value with a fresh curl handle each call.
+ * Simpler than persistent handles and avoids Windows keep-alive issues.    */
+static double daqstra_fetch(const char *url)
 {
-    snprintf(url_buf, DAQSTRA_MAX_URL, DAQSTRA_BASE "/api/v1/sensors/%s", sensor_id);
-    curl_easy_setopt(c, CURLOPT_URL,           url_buf);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS,    30L);
-    curl_easy_setopt(c, CURLOPT_NOSIGNAL,      1L);
-    /* Keep-alive: reuse the TCP connection across 170 Hz requests           */
-    curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(c, CURLOPT_TCP_KEEPIDLE,  5L);
-    curl_easy_setopt(c, CURLOPT_TCP_KEEPINTVL, 2L);
-}
-
-/* daqstra_get — fetch one sensor value using a pre-initialised handle.
- * The URL is already set; we only update WRITEDATA per call.              */
-static double daqstra_get_by_id(CURL *curl, const char *sensor_id)
-{
-    (void)sensor_id;   /* URL already baked into handle by daqstra_init_handle */
+    CURL *c = curl_easy_init();
+    if (!c) return NAN;
 
     CurlBuf body = {NULL, 0};
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(c, CURLOPT_URL,           url);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA,     &body);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS,    500L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL,      1L);
 
-    CURLcode rc = curl_easy_perform(curl);
+    CURLcode rc = curl_easy_perform(c);
+    curl_easy_cleanup(c);
+
     double val = NAN;
     if (rc == CURLE_OK && body.buf) {
         char *p = strstr(body.buf, "\"latest_value\"");
@@ -757,9 +748,15 @@ static double daqstra_get_by_id(CURL *curl, const char *sensor_id)
             p = strchr(p, ':');
             if (p) val = strtod(p + 1, NULL);
         }
+    } else if (rc != CURLE_OK) {
+        static int err_count = 0;
+        if (err_count < 5) {
+            fprintf(stderr, "[DAQ] curl error %d: %s\n", rc,
+                    curl_easy_strerror(rc));
+            err_count++;
+        }
     }
     free(body.buf);
-    /* Do NOT call curl_easy_reset() — that drops the keep-alive connection */
     return val;
 }
 
@@ -774,44 +771,36 @@ static void *sensor_thread(void *arg)
 {
     (void)arg;
 
-    /* Each handle owns its own persistent TCP connection to DAQstra.
-     * URL buffers are thread-local and outlive the handles.           */
-    CURL *c_pom = curl_easy_init();
-    CURL *c_pfm = curl_easy_init();
-    CURL *c_pc  = curl_easy_init();
-    if (!c_pom || !c_pfm || !c_pc) {
-        fprintf(stderr, "[DAQ] sensor_thread: curl_easy_init failed\n");
-        return NULL;
-    }
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    const long SENSOR_PERIOD_NS = (1000000000L / 170);
+
     char url_pom[DAQSTRA_MAX_URL];
     char url_pfm[DAQSTRA_MAX_URL];
     char url_pc [DAQSTRA_MAX_URL];
-    daqstra_init_handle(c_pom, SENSOR_ID_POM, url_pom);
-    daqstra_init_handle(c_pfm, SENSOR_ID_PFM, url_pfm);
-    daqstra_init_handle(c_pc,  SENSOR_ID_PC,  url_pc);
+    snprintf(url_pom, sizeof(url_pom), DAQSTRA_BASE "/api/v1/sensors/%s", SENSOR_ID_POM);
+    snprintf(url_pfm, sizeof(url_pfm), DAQSTRA_BASE "/api/v1/sensors/%s", SENSOR_ID_PFM);
+    snprintf(url_pc,  sizeof(url_pc),  DAQSTRA_BASE "/api/v1/sensors/%s", SENSOR_ID_PC);
 
-    struct timespec next;
-    clock_gettime(CLOCK_MONOTONIC, &next);
-    const long SENSOR_PERIOD_NS = (1000000000L / 170);  /* 5.882ms = 170 Hz */
+    printf("[DAQ] POM URL: %s\n", url_pom);
+    printf("[DAQ] PFM URL: %s\n", url_pfm);
+    printf("[DAQ] PC  URL: %s\n", url_pc);
 
     while (g_running) {
-        double pom = daqstra_get_by_id(c_pom, SENSOR_ID_POM);
-        double pfm = daqstra_get_by_id(c_pfm, SENSOR_ID_PFM);
-        double pc  = daqstra_get_by_id(c_pc,  SENSOR_ID_PC);
+        double pom = daqstra_fetch(url_pom);
+        double pfm = daqstra_fetch(url_pfm);
+        double pc  = daqstra_fetch(url_pc);
 
         pthread_mutex_lock(&sensor_mutex);
         if (!isnan(pom)) g_sensors.pom_psi = pom;
         if (!isnan(pfm)) g_sensors.pfm_psi = pfm;
         if (!isnan(pc))  g_sensors.pc_psi  = pc;
-        /* Stamp last_update whenever at least one sensor returned a valid value */
         if (!isnan(pom) || !isnan(pfm) || !isnan(pc)) {
             clock_gettime(CLOCK_MONOTONIC, &g_sensors.last_update);
             g_sensors.ever_updated = true;
         }
         pthread_mutex_unlock(&sensor_mutex);
 
-        /* Sleep until next 170 Hz tick.  If HTTP took longer than one tick,
-         * clock_nanosleep returns immediately and the thread self-corrects. */
         next.tv_nsec += SENSOR_PERIOD_NS;
         if (next.tv_nsec >= 1000000000L) {
             next.tv_nsec -= 1000000000L;
@@ -819,10 +808,6 @@ static void *sensor_thread(void *arg)
         }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
-
-    curl_easy_cleanup(c_pom);
-    curl_easy_cleanup(c_pfm);
-    curl_easy_cleanup(c_pc);
     return NULL;
 }
 
@@ -847,16 +832,25 @@ static void *sensor_thread(void *arg)
  *
  * If mock_daq is not running, POST fails silently — no impact on control.
  * ══════════════════════════════════════════════════════════════════════════ */
+/* Discard curl response body — used by daq_push_thread POST replies */
+static size_t curl_discard_cb(void *p, size_t sz, size_t n, void *u)
+{
+    (void)p; (void)u;
+    return sz * n;
+}
+
 static void *daq_push_thread(void *arg)
 {
     (void)arg;
     CURL *curl = curl_easy_init();
     if (!curl) return NULL;
 
-    curl_easy_setopt(curl, CURLOPT_URL,        DAQSTRA_BASE "/mock/valve_angles");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5L);     /* tight timeout — 170 Hz loop */
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,   1L);
-    curl_easy_setopt(curl, CURLOPT_POST,       1L);
+    curl_easy_setopt(curl, CURLOPT_URL,           DAQSTRA_BASE "/mock/valve_angles");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,    5L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,      1L);
+    curl_easy_setopt(curl, CURLOPT_POST,          1L);
+    /* Discard response body — POST reply is not used */
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
 
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");

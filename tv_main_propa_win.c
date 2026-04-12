@@ -340,9 +340,9 @@ static const double THETA_F = 40.67697413;   /* theta_f: IPA valve IC (deg) */
 
 /* Tick period in nanoseconds */
 #define TICK_NS             (1000000000L / CTRL_HZ)  /* 5,882,353 ns       */
-#define SENSOR_TIMEOUT_MS   500         /* Max age of sensor reading before
+#define SENSOR_TIMEOUT_MS   2000        /* Max age of sensor reading before
                                          * FAULT is triggered during RUNNING.
-                                         * 500ms = 33× the 15ms read cycle.  */
+                                         * 2000ms — generous for Windows HTTP overhead. */
 
 /* ══════════════════════════════════════════════════════════════════════════
  * DAQstra sensor cache — updated by sensor_thread, read by control loop
@@ -724,23 +724,29 @@ static size_t curl_write_cb(void *data, size_t sz, size_t n, void *userp)
 
 #define DAQSTRA_MAX_URL 512
 
-/* daqstra_fetch — fetch one sensor value with a fresh curl handle each call.
- * Simpler than persistent handles and avoids Windows keep-alive issues.    */
-static double daqstra_fetch(const char *url)
+/* daqstra_init_handle — configure a persistent CURL handle for one sensor.
+ * Persistent handles avoid TCP reconnect overhead at 170 Hz.
+ * CURLOPT_WRITEFUNCTION is set to curl_discard_cb to prevent libcurl from
+ * writing response bodies to stdout when not needed for parsing.           */
+static void daqstra_init_handle(CURL *c, const char *sensor_id, char *url_buf)
 {
-    CURL *c = curl_easy_init();
-    if (!c) return NAN;
-
-    CurlBuf body = {NULL, 0};
-    curl_easy_setopt(c, CURLOPT_URL,           url);
+    snprintf(url_buf, DAQSTRA_MAX_URL, DAQSTRA_BASE "/api/v1/sensors/%s", sensor_id);
+    curl_easy_setopt(c, CURLOPT_URL,           url_buf);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA,     &body);
     curl_easy_setopt(c, CURLOPT_TIMEOUT_MS,    500L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL,      1L);
+    curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(c, CURLOPT_TCP_KEEPIDLE,  5L);
+    curl_easy_setopt(c, CURLOPT_TCP_KEEPINTVL, 2L);
+}
 
-    CURLcode rc = curl_easy_perform(c);
-    curl_easy_cleanup(c);
+/* daqstra_get_by_id — fetch sensor value using pre-initialised handle.    */
+static double daqstra_get_by_id(CURL *curl)
+{
+    CurlBuf body = {NULL, 0};
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
 
+    CURLcode rc = curl_easy_perform(curl);
     double val = NAN;
     if (rc == CURLE_OK && body.buf) {
         char *p = strstr(body.buf, "\"latest_value\"");
@@ -751,8 +757,7 @@ static double daqstra_fetch(const char *url)
     } else if (rc != CURLE_OK) {
         static int err_count = 0;
         if (err_count < 5) {
-            fprintf(stderr, "[DAQ] curl error %d: %s\n", rc,
-                    curl_easy_strerror(rc));
+            fprintf(stderr, "[DAQ] curl error %d\n", rc);
             err_count++;
         }
     }
@@ -771,25 +776,32 @@ static void *sensor_thread(void *arg)
 {
     (void)arg;
 
-    struct timespec next;
-    clock_gettime(CLOCK_MONOTONIC, &next);
-    const long SENSOR_PERIOD_NS = (1000000000L / 170);
-
+    CURL *c_pom = curl_easy_init();
+    CURL *c_pfm = curl_easy_init();
+    CURL *c_pc  = curl_easy_init();
+    if (!c_pom || !c_pfm || !c_pc) {
+        fprintf(stderr, "[DAQ] sensor_thread: curl_easy_init failed\n");
+        return NULL;
+    }
     char url_pom[DAQSTRA_MAX_URL];
     char url_pfm[DAQSTRA_MAX_URL];
     char url_pc [DAQSTRA_MAX_URL];
-    snprintf(url_pom, sizeof(url_pom), DAQSTRA_BASE "/api/v1/sensors/%s", SENSOR_ID_POM);
-    snprintf(url_pfm, sizeof(url_pfm), DAQSTRA_BASE "/api/v1/sensors/%s", SENSOR_ID_PFM);
-    snprintf(url_pc,  sizeof(url_pc),  DAQSTRA_BASE "/api/v1/sensors/%s", SENSOR_ID_PC);
+    daqstra_init_handle(c_pom, SENSOR_ID_POM, url_pom);
+    daqstra_init_handle(c_pfm, SENSOR_ID_PFM, url_pfm);
+    daqstra_init_handle(c_pc,  SENSOR_ID_PC,  url_pc);
 
     printf("[DAQ] POM URL: %s\n", url_pom);
     printf("[DAQ] PFM URL: %s\n", url_pfm);
     printf("[DAQ] PC  URL: %s\n", url_pc);
 
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    const long SENSOR_PERIOD_NS = (1000000000L / 170);
+
     while (g_running) {
-        double pom = daqstra_fetch(url_pom);
-        double pfm = daqstra_fetch(url_pfm);
-        double pc  = daqstra_fetch(url_pc);
+        double pom = daqstra_get_by_id(c_pom);
+        double pfm = daqstra_get_by_id(c_pfm);
+        double pc  = daqstra_get_by_id(c_pc);
 
         pthread_mutex_lock(&sensor_mutex);
         if (!isnan(pom)) g_sensors.pom_psi = pom;
@@ -808,6 +820,10 @@ static void *sensor_thread(void *arg)
         }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
+
+    curl_easy_cleanup(c_pom);
+    curl_easy_cleanup(c_pfm);
+    curl_easy_cleanup(c_pc);
     return NULL;
 }
 

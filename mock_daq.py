@@ -52,8 +52,8 @@ tv_main.c calls these endpoints:
 The sensor IDs must EXACTLY MATCH the SENSOR_ID_* defines in tv_main.c.
 Default mapping:
   b1_log_data_ads1256%231  →  POM (LOX manifold pressure, psi)
-  b1_log_data_ads1256%232  →  PFM (IPA manifold pressure, psi)
-  b1_log_data_ads1256%233  →  PC  (chamber pressure, psi)
+  b1_log_data_ads1256%230  →  PFM (IPA manifold pressure, psi)
+  b1_log_data_ads1256%232  →  PC  (chamber pressure, psi)
 
 MOCK-ONLY ENDPOINTS
 -------------------
@@ -297,15 +297,15 @@ threading.Thread(target=physics_loop, daemon=True).start()
 #   channel = 0, 1, 2, ... (ADC input channel number)
 
 SENSOR_ID_MAP = {
-    "b1_log_data_ads1256%231": "pom_psi",   # Channel 1: LOX manifold pressure (POM)
-    "b1_log_data_ads1256%232": "pfm_psi",   # Channel 2: IPA manifold pressure (PFM)
-    "b1_log_data_ads1256%233": "pc_psi",    # Channel 3: Chamber pressure (PC)
+    "b1_log_data_ads1256%230": "pom_psi",   # Channel 0: LOX manifold pressure (POM)
+    "b1_log_data_ads1256%231": "pfm_psi",   # Channel 1: IPA manifold pressure (PFM)
+    "b1_log_data_ads1256%232": "pc_psi",    # Channel 2: Chamber pressure (PC)
 }
 
 SENSOR_TITLE_MAP = {
-    "b1_log_data_ads1256%231": "POM",
-    "b1_log_data_ads1256%232": "PFM",
-    "b1_log_data_ads1256%233": "PC",
+    "b1_log_data_ads1256%230": "POM",
+    "b1_log_data_ads1256%231": "PFM",
+    "b1_log_data_ads1256%232": "PC",
 }
 
 # =============================================================================

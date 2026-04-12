@@ -306,8 +306,8 @@ static inline struct can_frame kz_build_request_propa(
  * Example IDs from b1_log_data_ads1256 board (ADS1256 ADC channels).
  * # must be URL-encoded as %23 in the REST path.
  * Update these to match your actual board/channel wiring.           */
-#define SENSOR_ID_POM  "b1_log_data_ads1256%230" /* LOX manifold (psi) — channel 0 */
-#define SENSOR_ID_PFM  "b1_log_data_ads1256%231" /* IPA manifold (psi) — channel 1 */
+#define SENSOR_ID_POM  "b1_log_data_ads1256%230"  /* LOX manifold (psi) — channel 0 */
+#define SENSOR_ID_PFM  "b1_log_data_ads1256%231"  /* IPA manifold (psi) — channel 1 */
 #define SENSOR_ID_PC   "b1_log_data_ads1256%232"  /* Chamber     (psi) — channel 2 */
 
 /* Valve initial conditions at 500 lbf operating point.
@@ -728,28 +728,8 @@ static size_t curl_write_cb(void *data, size_t sz, size_t n, void *userp)
  * Simpler than persistent handles and avoids Windows keep-alive issues.    */
 static double daqstra_fetch(const char *url)
 {
-<<<<<<< HEAD
     CURL *c = curl_easy_init();
     if (!c) return NAN;
-=======
-    snprintf(url_buf, DAQSTRA_MAX_URL, DAQSTRA_BASE "/api/v1/sensors/%s", sensor_id);
-    curl_easy_setopt(c, CURLOPT_URL,           url_buf);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS,    500L);  /* 500ms — generous for Windows localhost */
-    curl_easy_setopt(c, CURLOPT_NOSIGNAL,      1L);
-    /* Keep-alive: reuse the TCP connection across 170 Hz requests           */
-    curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(c, CURLOPT_TCP_KEEPIDLE,  5L);
-    curl_easy_setopt(c, CURLOPT_TCP_KEEPINTVL, 2L);
-    printf("[DAQ] Sensor URL: %s\n", url_buf);
-}
-
-/* daqstra_get — fetch one sensor value using a pre-initialised handle.
- * The URL is already set; we only update WRITEDATA per call.              */
-static double daqstra_get_by_id(CURL *curl, const char *sensor_id)
-{
-    (void)sensor_id;   /* URL already baked into handle by daqstra_init_handle */
->>>>>>> 8c61cc5424a10ee14998067b99b5ff1aeacc0467
 
     CurlBuf body = {NULL, 0};
     curl_easy_setopt(c, CURLOPT_URL,           url);
@@ -770,11 +750,7 @@ static double daqstra_get_by_id(CURL *curl, const char *sensor_id)
         }
     } else if (rc != CURLE_OK) {
         static int err_count = 0;
-<<<<<<< HEAD
         if (err_count < 5) {
-=======
-        if (err_count < 5) {   /* only print first 5 errors to avoid spam */
->>>>>>> 8c61cc5424a10ee14998067b99b5ff1aeacc0467
             fprintf(stderr, "[DAQ] curl error %d: %s\n", rc,
                     curl_easy_strerror(rc));
             err_count++;

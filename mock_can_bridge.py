@@ -51,9 +51,13 @@ import argparse
 import math
 import time
 import threading
-import requests
 import can
 from typing import Optional, Tuple   # python-can library: pip3 install python-can
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 # =============================================================================
 # J1939 ADDRESS CONSTANTS
@@ -173,7 +177,7 @@ class MockCANBridge:
 
     def __init__(self, iface: str, daq_url: str, backend: str = "socketcan"):
         self.iface   = iface
-        self.daq_url = daq_url.rstrip("/")
+        self.daq_url = daq_url.rstrip("/") if daq_url and daq_url.lower() != "none" else ""
         self.backend = backend
         self.bus     = None
 
@@ -244,6 +248,8 @@ class MockCANBridge:
         Uses a short timeout to avoid blocking the feedback thread if mock_daq
         is slow or unreachable.
         """
+        if not self.daq_url or requests is None:
+            return
         try:
             requests.post(
                 f"{self.daq_url}/mock/valve_angles",
@@ -356,7 +362,10 @@ class MockCANBridge:
         threading.Thread(target=feedback_loop, daemon=True).start()
 
         print(f"[Bridge] Listening for Prop A / Prop A2 commands on {self.iface} ({self.backend})...")
-        print(f"[Bridge] Will relay valve angles to {self.daq_url}")
+        if self.daq_url:
+            print(f"[Bridge] Will relay valve angles to {self.daq_url}")
+        else:
+            print("[Bridge] DAQ relay disabled")
 
         # Main thread: receive and parse CAN frames
         while True:
@@ -409,8 +418,8 @@ if __name__ == "__main__":
     ap.add_argument("--iface",   default=default_iface,
                     help=f"CAN interface (default: {default_iface}). "
                          "Linux: can0/can1/vcan0. Windows: PCAN_USBBUS1/PCAN_USBBUS2")
-    ap.add_argument("--daq",     default="http://localhost:8050",
-                    help="mock_daq.py base URL (default: http://localhost:8050)")
+    ap.add_argument("--daq",     default="none",
+                    help="mock_daq.py base URL, or 'none' to disable (default: none)")
     ap.add_argument("--backend", default=default_backend,
                     help=f"python-can backend (default: {default_backend}). "
                          "Linux: socketcan. Windows: pcan")
